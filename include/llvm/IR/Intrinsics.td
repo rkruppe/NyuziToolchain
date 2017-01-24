@@ -808,6 +808,14 @@ def int_memcpy_element_atomic  : Intrinsic<[],
 
 def int_ssa_copy : Intrinsic<[llvm_any_ty], [LLVMMatchType<0>],
                              [IntrNoMem, Returned<0>]>;
+
+//===------ SPMD vectorization intrinsics ------===//
+//
+
+def int_spmd_call : Intrinsic<[], [llvm_ptr_ty, llvm_ptr_ty], [], "llvm.spmd.call">;
+
+def int_spmd_lane_id : Intrinsic<[llvm_i32_ty], [], [], "llvm.spmd.lane_id">;
+
 //===----------------------------------------------------------------------===//
 // Target-specific intrinsics
 //===----------------------------------------------------------------------===//

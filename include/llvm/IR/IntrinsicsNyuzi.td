@@ -59,8 +59,5 @@ def int_nyuzi_shufflei : Intrinsic<[llvm_v16i32_ty], [llvm_v16i32_ty, llvm_v16i3
 def int_nyuzi_shufflef : Intrinsic<[llvm_v16f32_ty], [llvm_v16f32_ty, llvm_v16i32_ty],
 	[IntrNoMem], "llvm.nyuzi.__builtin_nyuzi_shufflef">;
 
-
-
-
 }
 
