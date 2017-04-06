@@ -1,4 +1,4 @@
-add_llvm_utility(FileCheck
+add_llvm_tool(FileCheck
   FileCheck.cpp
   )
 
