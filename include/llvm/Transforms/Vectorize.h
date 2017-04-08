@@ -146,6 +146,12 @@ bool vectorizeBasicBlock(Pass *P, BasicBlock &BB,
 //
 Pass *createLoadStoreVectorizerPass();
 
+//===----------------------------------------------------------------------===//
+//
+// LowerSPMD - Create a SPMD vectorizer pass.
+//
+Pass *createLowerSPMDPass();
+
 } // End llvm namespace
 
 #endif

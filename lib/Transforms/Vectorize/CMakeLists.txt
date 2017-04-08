@@ -2,6 +2,7 @@ add_llvm_library(LLVMVectorize
   BBVectorize.cpp
   LoadStoreVectorizer.cpp
   LoopVectorize.cpp
+  LowerSPMD.cpp
   SLPVectorizer.cpp
   Vectorize.cpp
 

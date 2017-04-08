@@ -42,6 +42,9 @@ void LLVMAddLoopVectorizePass(LLVMPassManagerRef PM);
 /** See llvm::createSLPVectorizerPass function. */
 void LLVMAddSLPVectorizePass(LLVMPassManagerRef PM);
 
+/** See llvm::createLowerSPMDPass function. */
+void LLVMAddLowerSPMDPass(LLVMPassManagerRef PM);
+
 /**
  * @}
  */
