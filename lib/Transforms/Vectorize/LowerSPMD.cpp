@@ -14,7 +14,7 @@
 #include "llvm/Transforms/Utils/LoopUtils.h"
 using namespace llvm;
 
-#define DEBUG_TYPE "LowerSPMD"
+#define DEBUG_TYPE "lowerspmd"
 
 namespace {
 
@@ -22,7 +22,6 @@ const unsigned SIMD_WIDTH = 16;
 const char *CONDITION_METADATA_ID = "spmd-conditional";
 
 template <typename T> using BBMap = DenseMap<BasicBlock *, T>;
-using CondVec = SmallVector<Value *, 2>;
 
 struct Conditions {
   Function &F;
@@ -73,32 +72,32 @@ struct Conditions {
 
 struct InstVectorizeVisitor : InstVisitor<InstVectorizeVisitor> {
   LLVMContext &Context;
-  Function &ResultF;
+  Function &VectorFunc;
   DenseMap<Instruction *, Value *> Scalar2Vector;
   DenseMap<BasicBlock *, BasicBlock *> BlockMap;
+  const DenseMap<Function *, Function *> &VectorizedFunctions;
 
-  BasicBlock *VecBB;
+  BasicBlock *VecBB = nullptr;
 
-  SmallVector<Value *, 8> ArgumentSplats;
+  SmallVector<Value *, 8> Arguments;
 
-  InstVectorizeVisitor(Function &ResultF)
-      : Context(ResultF.getContext()), ResultF(ResultF) {
-    // TODO: at latest once multiple functions are supported, broadcasting is
-    // not always correct and should thus be left to the caller -- instead, the
-    // function signature should change to take vectors.
-    VecBB = BasicBlock::Create(Context, "", &ResultF);
-    auto Builder = getBuilder();
-    for (auto It = ResultF.arg_begin(), End = ResultF.arg_end(); It != End;
-         ++It) {
-      ArgumentSplats.push_back(Builder.CreateVectorSplat(SIMD_WIDTH, &*It));
+  InstVectorizeVisitor(
+      Function &VectorFunc,
+      const DenseMap<Function *, Function *> &VectorizedFunctions)
+      : Context(VectorFunc.getContext()), VectorFunc(VectorFunc),
+        VectorizedFunctions(VectorizedFunctions) {
+    for (auto &Arg : VectorFunc.args()) {
+      Arguments.push_back(&Arg);
     }
   }
 
   IRBuilder<> getBuilder() { return IRBuilder<>(VecBB); }
 
   void visitBasicBlock(BasicBlock &BB) {
-    auto NewBB = BasicBlock::Create(Context, BB.getName(), &ResultF);
-    getBuilder().CreateBr(NewBB);
+    auto NewBB = BasicBlock::Create(Context, BB.getName(), &VectorFunc);
+    if (VecBB) {
+      getBuilder().CreateBr(NewBB);
+    }
     VecBB = NewBB;
     BlockMap[&BB] = VecBB;
   }
@@ -112,8 +111,13 @@ struct InstVectorizeVisitor : InstVisitor<InstVectorizeVisitor> {
   }
 
   void visitReturnInst(ReturnInst &Ret) {
-    assert(!Ret.getReturnValue());
-    getBuilder().CreateRetVoid();
+    // Previous steps ensure there's only one return per function.
+    if (auto RetVal = Ret.getReturnValue()) {
+      auto VecReturn = getBuilder().CreateRet(getVectorized(RetVal));
+      setVectorized(&Ret, VecReturn);
+    } else {
+      getBuilder().CreateRetVoid();
+    }
   }
 
   void visitAllocaInst(AllocaInst &Alloca) {
@@ -126,22 +130,27 @@ struct InstVectorizeVisitor : InstVisitor<InstVectorizeVisitor> {
 
     auto I32Ty = IntegerType::get(Context, 32);
     auto ArraySize = ConstantInt::get(I32Ty, SIMD_WIDTH);
-    auto WholeAlloca = getBuilder().CreateAlloca(Alloca.getAllocatedType(), ArraySize);
+    auto WholeAlloca =
+        getBuilder().CreateAlloca(Alloca.getAllocatedType(), ArraySize);
     WholeAlloca->setAlignment(Alloca.getAlignment());
 
     SmallVector<Constant *, SIMD_WIDTH> LaneIds;
     for (uint64_t i = 0; i < SIMD_WIDTH; ++i) {
       LaneIds.push_back(ConstantInt::get(I32Ty, i));
     }
-    auto VecAllocas = getBuilder().CreateGEP(Alloca.getAllocatedType(), WholeAlloca,
-                                             ConstantVector::get(LaneIds));
+    auto VecAllocas = getBuilder().CreateGEP(
+        Alloca.getAllocatedType(), WholeAlloca, ConstantVector::get(LaneIds));
 
     setVectorized(&Alloca, VecAllocas, /* Conditional= */ true);
   }
 
-  void visitCallInst(CallInst &Call) {
-    auto Callee = Call.getCalledFunction();
-    if (Callee->getIntrinsicID() == Intrinsic::spmd_lane_id) {
+  void visitIntrinsicInst(IntrinsicInst &Call) {
+    switch (Call.getIntrinsicID()) {
+    default:
+      // Let's treat it like a normal call and hope it works
+      visitCallInst(Call);
+      break;
+    case Intrinsic::spmd_lane_id: {
       auto I32Ty = IntegerType::get(Context, 32);
       SmallVector<Constant *, SIMD_WIDTH> LaneIds;
       for (uint64_t i = 0; i < SIMD_WIDTH; ++i) {
@@ -149,13 +158,74 @@ struct InstVectorizeVisitor : InstVisitor<InstVectorizeVisitor> {
       }
       // As this function is pure, ignoring the mask is OK.
       setVectorized(&Call, ConstantVector::get(LaneIds),
-                    /* Conditional= */ true);
-    } else if (Callee->getIntrinsicID() == Intrinsic::lifetime_start ||
-               Callee->getIntrinsicID() == Intrinsic::lifetime_end) {
-      // Just drop lifetime intrinsics
-      // TODO: reconsider
+                    /* Conditional: */ true);
+      break;
+    }
+    case Intrinsic::lifetime_start:
+    case Intrinsic::lifetime_end:
+      // For now just drop lifetime intrinsics.
+      // TODO: Support them, there's a 1:1 mapping between allocas so it
+      // should be easy and useful
+      break;
+    case Intrinsic::dbg_declare:
+    case Intrinsic::dbg_value:
+      // For now just drop debug info.
+      // Might want to support debug info in the future, but that is
+      // low priority and it's not obvious whether it's easy.
+      break;
+    case Intrinsic::expect:
+      // TODO use these to guide linearization (and also branch weights, btw)
+      // For now, just ignore the hint and use the value passed in
+      setVectorized(&Call, getVectorized(Call.getArgOperand(0)),
+                    /* Conditional: */ true /* FIXME this is wrong */);
+      break;
+    }
+  }
+
+  void visitCallInst(CallInst &Call) {
+    auto Callee = Call.getCalledFunction();
+    if (auto VectorCallee = VectorizedFunctions.lookup(Callee)) {
+      SmallVector<Value *, 8> VectorArgs;
+      auto Mask = getVectorized(getCondition(&Call));
+      VectorArgs.push_back(Mask);
+      for (auto &Arg : Call.arg_operands()) {
+        VectorArgs.push_back(getVectorized(&*Arg));
+      }
+      // Only do the call if any lanes need it. This can not only save
+      // time for expensive functions, it also makes recursion work.
+      auto Builder = getBuilder();
+      auto MaskIntTy = IntegerType::get(Context, SIMD_WIDTH);
+      auto MaskAsInt = Builder.CreateBitCast(Mask, MaskIntTy);
+      auto NeedCall = Builder.CreateICmpNE(
+          MaskAsInt, ConstantInt::get(MaskIntTy, 0), "need_call");
+
+      auto CallBB =
+          BasicBlock::Create(Context, "call." + Callee->getName(), &VectorFunc);
+      IRBuilder<> CallBuilder(CallBB);
+      // TODO transplant attributes as appropriate
+      // (some, especially argument attributes, may not apply)
+      auto VectorCall = CallBuilder.CreateCall(VectorCallee, VectorArgs);
+
+      auto NextBB = BasicBlock::Create(Context, VecBB->getName(), &VectorFunc);
+      CallBuilder.CreateBr(NextBB);
+      Builder.CreateCondBr(NeedCall, CallBB, NextBB);
+
+      auto OldBB = VecBB;
+      auto RetTy = VectorCallee->getReturnType();
+      if (!RetTy->isVoidTy()) {
+        VecBB = NextBB;
+        auto Phi = getBuilder().CreatePHI(RetTy, 2);
+        auto Undef = UndefValue::get(RetTy);
+        Phi->addIncoming(VectorCall, CallBB);
+        Phi->addIncoming(Undef, OldBB);
+        setVectorized(&Call, Phi, /* Conditional: */ true);
+      } else {
+        VecBB = CallBB;
+        setVectorized(&Call, VectorCall, /* Conditional: */ true);
+      }
+      VecBB = NextBB;
     } else {
-      // TODO handle vectorized functions with a single call
+      // Slow path for functions that don't have vectorized versions
       auto Mask = getVectorized(getCondition(&Call));
       SmallVector<Value *, 4> VecArgs;
       for (Use &Arg : Call.arg_operands()) {
@@ -166,7 +236,8 @@ struct InstVectorizeVisitor : InstVisitor<InstVectorizeVisitor> {
         LaneResults.push_back(createConditionalCall(Call, VecArgs, Mask, i));
       }
       if (!Call.getType()->isVoidTy()) {
-        setVectorized(&Call, assembleVector(&Call, LaneResults));
+        setVectorized(&Call, assembleVector(&Call, LaneResults),
+                      /* Conditional: */ true);
       }
     }
   }
@@ -178,8 +249,8 @@ struct InstVectorizeVisitor : InstVisitor<InstVectorizeVisitor> {
     assert(Callee);
 
     auto CondBB = BasicBlock::Create(Context, "maskedcall." + Callee->getName(),
-                                     &ResultF);
-    auto NewVecBB = BasicBlock::Create(Context, "linearized", &ResultF);
+                                     &VectorFunc);
+    auto NewVecBB = BasicBlock::Create(Context, "linearized", &VectorFunc);
     CondBB->moveAfter(VecBB);
     NewVecBB->moveAfter(CondBB);
 
@@ -201,9 +272,6 @@ struct InstVectorizeVisitor : InstVisitor<InstVectorizeVisitor> {
     // uses any more. But because we know the value is only used if the
     // condition is met, we can insert a phi like this to fix that:
     //   phi [ undef, CurrBB ], [ Replacement, CondBB ]
-    // This isn't what we want for simple operations that can get vectorized
-    // with a mask later (e.g., loads and stores) but it's simple enough to
-    // recognize.
     auto Type = Call.getType();
     if (Type->isVoidTy()) {
       return nullptr;
@@ -278,19 +346,16 @@ struct InstVectorizeVisitor : InstVisitor<InstVectorizeVisitor> {
     if (auto MD = I->getMetadata(CONDITION_METADATA_ID)) {
       return cast<ValueAsMetadata>(&*MD->getOperand(0))->getValue();
     } else {
-      report_fatal_error("Expected condition metadata");
+      std::string msg;
+      raw_string_ostream Msg(msg);
+      Msg << "LowerSPMD: condition metadata missing on: ";
+      I->print(Msg);
+      report_fatal_error(Msg.str());
     }
   }
 
   void setVectorized(Instruction *Scalar, Value *Vectorized,
                      bool Conditional = false) {
-/*
-    DEBUG(dbgs() << "Vectorizing: ");
-    DEBUG(Scalar->print(dbgs()));
-    DEBUG(dbgs() << " => \t");
-    DEBUG(Vectorized->print(dbgs()));
-    DEBUG(dbgs() << "\n");
-*/
     if (auto VecInst = dyn_cast<Instruction>(Vectorized)) {
       if (!VecInst->getParent()) {
         VecBB->getInstList().push_back(VecInst);
@@ -298,6 +363,14 @@ struct InstVectorizeVisitor : InstVisitor<InstVectorizeVisitor> {
         assert(VecInst->getParent() == VecBB);
       }
     }
+    Vectorized->setName(Scalar->getName());
+
+    DEBUG(dbgs() << "Replacing scalar instruction:\n");
+    DEBUG(Scalar->print(dbgs()));
+    DEBUG(dbgs() << "\nwith vectorized instruction:\n");
+    DEBUG(Vectorized->print(dbgs()));
+    DEBUG(dbgs() << "\n");
+
     if (Conditional) {
       assert(Scalar->getMetadata(CONDITION_METADATA_ID) &&
              "Unconditional instruction masked");
@@ -305,18 +378,15 @@ struct InstVectorizeVisitor : InstVisitor<InstVectorizeVisitor> {
       assert(!Scalar->getMetadata(CONDITION_METADATA_ID) &&
              "Conditional instruction not masked");
     }
-    Vectorized->setName(Scalar->getName());
     Scalar2Vector[Scalar] = Vectorized;
   }
 
   Value *getVectorized(Value *Scalar) {
     if (auto I = dyn_cast<Instruction>(Scalar)) {
-      if (!Scalar2Vector.count(I)) // TODO HACK
-        return UndefValue::get(getVectorType(Scalar->getType()));
       assert(Scalar2Vector.count(I));
       return Scalar2Vector[I];
     } else if (auto Arg = dyn_cast<Argument>(Scalar)) {
-      return ArgumentSplats[Arg->getArgNo()];
+      return Arguments[Arg->getArgNo()];
     } else {
       assert(isa<Constant>(Scalar));
       return getBuilder().CreateVectorSplat(SIMD_WIDTH, Scalar);
@@ -341,37 +411,78 @@ struct InstVectorizeVisitor : InstVisitor<InstVectorizeVisitor> {
 
 struct FunctionVectorizer {
   LLVMContext &Context;
+  Function *LinearFunc;
   Function *VectorFunc;
+  const DenseMap<Function *, Function *> &VectorizedFunctions;
   DominatorTree DomTree;
   LoopInfo LI;
 
-  FunctionVectorizer(Function &F) : Context(F.getContext()) {
+  FunctionVectorizer(
+      Function &F, Function &VF,
+      const DenseMap<Function *, Function *> &VectorizedFunctions)
+      : Context(F.getContext()), VectorFunc(&VF),
+        VectorizedFunctions(VectorizedFunctions) {
+    // We need to clone the source function at the very least to change the
+    // signature. But since we already have a copy, we also mangle that copy in-
+    // place, which would be incorrect otherwise (scalar code could call it).
+    ValueToValueMapTy ArgMapping;
+    SmallVector<ReturnInst *, 1> Returns;
+    LinearFunc = prepareScalarFunction(F, ArgMapping);
+    CloneFunctionInto(LinearFunc, &F, ArgMapping,
+                      /* ModuleLevelChanges: */ false, Returns);
+
+    if (Returns.size() != 1) {
+      report_fatal_error("LowerSPMD: cannot vectorize function with multiple "
+                         "returns, run mergereturn");
+    }
+
+    DomTree = DominatorTree(*LinearFunc);
+    LI = LoopInfo(DomTree);
     if (!LI.empty()) {
       DEBUG(LI.print(dbgs()));
       DEBUG(dbgs() << '\n');
       report_fatal_error("TODO support loops");
     }
-    ValueToValueMapTy Scalar2Vector;
-    // TODO create a function with an added argument for the entry block mask,
-    // then CloneIntoFunction that
+  }
 
-    // Clone the function because there might be calls from scalar code.
-    VectorFunc = CloneFunction(&F, Scalar2Vector);
-    DomTree = DominatorTree(*VectorFunc);
-    LI = LoopInfo(DomTree);
+  // Create an empty function with the same prototype as F, except that an
+  // additional i1 argument (the condition for the entry block) is inserted
+  // before the first argument.
+  // Also fills out a mapping from the input function's arguments to the output
+  // function's arguments, for CloneFunctionInto
+  Function *prepareScalarFunction(Function &F, ValueToValueMapTy &ArgMapping) {
+    SmallVector<Type *, 8> ArgsPlusCond;
+    ArgsPlusCond.push_back(Type::getInt1Ty(F.getContext()));
+    for (auto ArgTy : F.getFunctionType()->params()) {
+      ArgsPlusCond.push_back(ArgTy);
+    }
+    assert(!F.isVarArg()); // TODO necessary?
+    auto NewFT = FunctionType::get(F.getReturnType(), ArgsPlusCond,
+                                   /* isVarArg: */ false);
+    auto NewF =
+        Function::Create(NewFT, F.getLinkage(), F.getName(), F.getParent());
+    auto NewArgsIter = NewF->arg_begin();
+    ++NewArgsIter; // skip the condition we added
+    for (auto &OldArg : F.args()) {
+      assert(NewArgsIter != NewF->arg_end());
+      ArgMapping[&OldArg] = &*NewArgsIter;
+      ++NewArgsIter;
+    }
+    assert(NewArgsIter == NewF->arg_end());
+    return NewF;
   }
 
   void createBlockConditions(Conditions &Conds) {
     BBMap<Value *> PlaceholderConds = Conds.ForBlock;
     BBMap<std::vector<Value *>> IncomingConds;
-    for (auto &From : *VectorFunc) {
+    for (auto &From : *LinearFunc) {
       for (auto KVPair : Conds.ForEdge[&From]) {
         BasicBlock &To = *KVPair.getFirst();
         IncomingConds[&To].push_back(Conds.ForEdge[&From][&To]);
       }
     }
 
-    for (BasicBlock &BB : *VectorFunc) {
+    for (BasicBlock &BB : *LinearFunc) {
       IRBuilder<> Builder(&BB, BB.getFirstInsertionPt());
       Value *Cond = nullptr;
       for (Value *IncomingCond : IncomingConds[&BB]) {
@@ -382,10 +493,11 @@ struct FunctionVectorizer {
         }
       }
       if (!Cond) {
-        assert(&BB == &VectorFunc->getEntryBlock() && "unreachable block");
-        Cond = Builder.getTrue();
-        assert(Cond->getType() == IntegerType::get(Context, 1));
+        assert(&BB == &LinearFunc->getEntryBlock() && "unreachable block");
+        // The condition for the entry block is passed in as the first argument,
+        Cond = &*LinearFunc->arg_begin();
       }
+      assert(Cond->getType() == IntegerType::get(Context, 1));
       Conds.forBlock(&BB) = Cond;
     }
 
@@ -395,13 +507,13 @@ struct FunctionVectorizer {
     // and (2) it complicates type signatures everywhere for something that
     // can be solved locally here.
     DenseMap<Value *, Value *> Replace;
-    for (auto &BB : *VectorFunc) {
+    for (auto &BB : *LinearFunc) {
       Value *Cond = Conds.forBlock(&BB);
       Value *Placeholder = PlaceholderConds[&BB];
       Placeholder->replaceAllUsesWith(Cond);
       Replace[Placeholder] = Cond;
     }
-    for (auto &BB : *VectorFunc) {
+    for (auto &BB : *LinearFunc) {
       auto NewV = Replace.find(Conds.forBlock(&BB));
       if (NewV != Replace.end()) {
         Conds.forBlock(&BB) = NewV->getSecond();
@@ -423,18 +535,17 @@ struct FunctionVectorizer {
   void createEdgeConditions(BasicBlock &BB, Conditions &Conds) {
     auto *BlockCond = Conds.forBlock(&BB);
     auto *T = BB.getTerminator();
+    if (isa<UnreachableInst>(T) || isa<ReturnInst>(T)) {
+      // No successors => nothing to do.
+      return;
+    }
     auto *Br = dyn_cast<BranchInst>(T);
     if (!Br) {
-      if (isa<UnreachableInst>(T) || isa<ReturnInst>(T)) {
-        // No successors => nothing to do.
-        return;
-      } else {
-        std::string msg;
-        raw_string_ostream Msg(msg);
-        Msg << "LowerSPMD cannot handle terminator: ";
-        T->print(Msg);
-        report_fatal_error(Msg.str());
-      }
+      std::string msg;
+      raw_string_ostream Msg(msg);
+      Msg << "LowerSPMD: cannot handle terminator: ";
+      T->print(Msg);
+      report_fatal_error(Msg.str());
     }
     auto FoundEdgeCond = [&](BasicBlock *Succ, Value *Cond) {
       DEBUG(dbgs() << "Jump " << BB.getName() << " -> " << Succ->getName()
@@ -464,7 +575,7 @@ struct FunctionVectorizer {
 
   void createBlockConditionPlaceholders(Conditions &Conds) {
     Value *False = ConstantInt::getFalse(Context);
-    for (BasicBlock &BB : *VectorFunc) {
+    for (BasicBlock &BB : *LinearFunc) {
       Instruction *ip = &*BB.getFirstInsertionPt();
       Instruction *Placeholder =
           BinaryOperator::Create(BinaryOperator::Or, False, False,
@@ -482,24 +593,25 @@ struct FunctionVectorizer {
 
   void PhiToSelect(PHINode *Phi, Conditions &Conds, BasicBlock *OldBB,
                    BasicBlock *LinearBB) {
-    assert(Phi->getNumIncomingValues() == 2 &&
-           "PHI with 1 or 3+ incoming values not suported yet");
-    auto Cond0 = Conds.forEdge(Phi->getIncomingBlock(0), OldBB);
-    auto Val0 = Phi->getIncomingValue(0);
-    auto Val1 = Phi->getIncomingValue(1);
+    auto Result = Phi->getIncomingValue(0);
+    auto Cond = Conds.forEdge(Phi->getIncomingBlock(0), OldBB);
     IRBuilder<> Builder(LinearBB);
-    auto Select = Builder.CreateSelect(
-        Cond0, Val0, Val1, "mix." + Val0->getName() + "." + Val1->getName());
-    Phi->replaceAllUsesWith(Select);
+    for (unsigned i = 1; i < Phi->getNumIncomingValues(); ++i) {
+      Result = Builder.CreateSelect(Cond, Result, Phi->getIncomingValue(i),
+                                    Phi->getName());
+      Cond = Conds.forEdge(Phi->getIncomingBlock(i), OldBB);
+    }
+    Phi->replaceAllUsesWith(Result);
     Phi->eraseFromParent();
   }
 
   void linearizeCFG(Conditions &Conds) {
-    ReversePostOrderTraversal<Function *> RPOT(VectorFunc);
+    ReversePostOrderTraversal<Function *> RPOT(LinearFunc);
     std::vector<BasicBlock *> BBsInTopologicalOrder(RPOT.begin(), RPOT.end());
 
-    auto *LinearBB = BasicBlock::Create(Context, "linearized", VectorFunc,
-                                        &VectorFunc->getEntryBlock());
+    auto *LinearBB = BasicBlock::Create(Context, "linearized", LinearFunc,
+                                        &LinearFunc->getEntryBlock());
+    Instruction *Return = nullptr;
 
     for (auto SourceBB : BBsInTopologicalOrder) {
       auto BlockCond = Conds.forBlock(SourceBB);
@@ -507,14 +619,23 @@ struct FunctionVectorizer {
         Instruction *I = &SourceBB->front();
         if (auto *Phi = dyn_cast<PHINode>(I)) {
           PhiToSelect(Phi, Conds, SourceBB, LinearBB);
-        } else if (auto *Ret = dyn_cast<ReturnInst>(I)) {
-          // TODO handle return values
-          assert(!Ret->getReturnValue());
-          I->eraseFromParent();
+        } else if (isa<ReturnInst>(I)) {
+          // The constructor ensured there's only one return.
+          // Because of unreachable instructions, the BB with the return
+          // may not be last in the topological order, so to ensure
+          // the return is at the end of the linearized function we remember
+          // it and put it at the very end after we've visited all BBs.
+          assert(!Return);
+          Return = I;
+          I->removeFromParent();
         } else if (isa<TerminatorInst>(I)) {
           I->eraseFromParent();
         } else {
           if (!isSafeToSpeculativelyExecute(I)) {
+            markAsConditional(I, BlockCond);
+          }
+          // HACK should support unmasked gather/scatter and intrinsic calls
+          else if (isa<LoadInst>(I) || isa<StoreInst>(I) || isa<CallInst>(I)) {
             markAsConditional(I, BlockCond);
           }
           I->removeFromParent();
@@ -523,29 +644,26 @@ struct FunctionVectorizer {
       }
     }
 
+    assert(Return);
+    LinearBB->getInstList().push_back(Return);
+
     // We're turning phis into selects on the fly, so we can't
     // remove BBs in the loop since we might access them while
     // processing later phis.
     for (auto BB : BBsInTopologicalOrder) {
       BB->eraseFromParent();
     }
-
-    IRBuilder<> Builder(LinearBB);
-    Builder.CreateRetVoid();
   }
 
   Function *run() {
-    Conditions Conds(*VectorFunc);
+    Conditions Conds(*LinearFunc);
     createBlockConditionPlaceholders(Conds);
 
     // First, we materialize the (scalar) condition for *every* outgoing edge.
     // Some of these values are constant (unconditional branches) or redundant
     // (the negated condition for the `false` branch of a conditional branch),
     // but they will be needed later to construct the masks for vectorization.
-    // The representation of choise is: For each BB, store a vector where the
-    // i-th value is the condition for the i-th outgoing edge (i.e., the edge
-    // to the i-th successor).
-    for (auto &BB : *VectorFunc) {
+    for (auto &BB : *LinearFunc) {
       createEdgeConditions(BB, Conds);
     }
     createBlockConditions(Conds);
@@ -558,22 +676,18 @@ struct FunctionVectorizer {
     // TODO support loops at all
 
     DEBUG(dbgs() << "===================================================\n");
-    DEBUG(VectorFunc->print(dbgs()));
+    DEBUG(LinearFunc->print(dbgs()));
 
     DEBUG(dbgs() << "===================================================\n");
     linearizeCFG(Conds);
-    DEBUG(VectorFunc->print(dbgs()));
+    DEBUG(LinearFunc->print(dbgs()));
 
     DEBUG(dbgs() << "===================================================\n");
-    auto ResultF = Function::Create(
-        VectorFunc->getFunctionType(), VectorFunc->getLinkage(),
-        VectorFunc->getName() + ".vector", VectorFunc->getParent());
-    InstVectorizeVisitor IVV(*ResultF);
-    IVV.visit(*VectorFunc);
-    // DEBUG(ResultF->print(dbgs()));
+    InstVectorizeVisitor IVV(*VectorFunc, VectorizedFunctions);
+    IVV.visit(*LinearFunc);
 
-    VectorFunc->eraseFromParent();
-    return ResultF;
+    LinearFunc->eraseFromParent();
+    return VectorFunc;
   }
 };
 
@@ -628,6 +742,30 @@ findFunctionsToVectorize(const std::vector<CallInst *> &Roots) {
   return Result;
 }
 
+// Create a function with the same signature as ScalarFunc, except that:
+// (1) it takes a mask argument as new first argument, and
+// (2) all arguments and the return value are turned into vectors
+Function *predefineVectorizedFunction(Function &ScalarFunc) {
+  auto ScalarFT = ScalarFunc.getFunctionType();
+  SmallVector<Type *, 8> VectorArgTys;
+  auto I1Ty = IntegerType::get(ScalarFunc.getContext(), 1);
+  VectorArgTys.push_back(VectorType::get(I1Ty, SIMD_WIDTH));
+  for (auto ArgTy : ScalarFT->params()) {
+    VectorArgTys.push_back(VectorType::get(ArgTy, SIMD_WIDTH));
+  }
+  assert(!ScalarFT->isVarArg());
+  auto VoidTy = Type::getVoidTy(ScalarFunc.getContext());
+  auto ScalarReturnTy = ScalarFT->getReturnType();
+  auto VectorReturnTy = ScalarReturnTy->isVoidTy()
+                            ? VoidTy
+                            : VectorType::get(ScalarReturnTy, SIMD_WIDTH);
+  auto VectorFT = FunctionType::get(VectorReturnTy, VectorArgTys,
+                                    /* isVarArg: */ false);
+  return Function::Create(VectorFT, ScalarFunc.getLinkage(),
+                          ScalarFunc.getName() + ".vector",
+                          ScalarFunc.getParent());
+}
+
 struct LowerSPMD : public ModulePass {
   static char ID; // Pass identification, replacement for typeid
   LowerSPMD() : ModulePass(ID) {}
@@ -639,18 +777,30 @@ struct LowerSPMD : public ModulePass {
       RootCalls.push_back(cast<CallInst>(U));
     }
 
+    auto ScalarFuncs = findFunctionsToVectorize(RootCalls);
     DenseMap<Function *, Function *> Vectorized;
-    for (Function *F : findFunctionsToVectorize(RootCalls)) {
-      FunctionVectorizer FV(*F);
-      Vectorized[F] = FV.run();
+    // Vectorized functions may call each other (including recursively), so
+    // declare vectorized versions of all functions before defining any.
+    for (Function *F : ScalarFuncs) {
+      Vectorized[F] = predefineVectorizedFunction(*F);
     }
+    for (Function *F : ScalarFuncs) {
+      FunctionVectorizer FV(*F, *Vectorized[F], Vectorized);
+      FV.run();
+    }
+    DEBUG(dbgs() << "===================================================\n");
 
     for (auto Call : RootCalls) {
       auto ScalarF = unwrapFunctionBitcast(Call->getArgOperand(0));
       auto Arg = Call->getArgOperand(1);
       IRBuilder<> Builder(Call);
       assert(Vectorized.count(ScalarF));
-      Builder.CreateCall(Vectorized[ScalarF], Arg);
+
+      SmallVector<Value *, 2> Args;
+      auto True = ConstantInt::getTrue(ScalarF->getContext());
+      Args.push_back(Builder.CreateVectorSplat(SIMD_WIDTH, True));
+      Args.push_back(Builder.CreateVectorSplat(SIMD_WIDTH, Arg));
+      Builder.CreateCall(Vectorized[ScalarF], Args);
       Call->eraseFromParent();
     }
 
