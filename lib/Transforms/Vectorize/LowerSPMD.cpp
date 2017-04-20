@@ -77,9 +77,15 @@ struct InstVectorizeVisitor : InstVisitor<InstVectorizeVisitor> {
   DenseMap<BasicBlock *, BasicBlock *> BlockMap;
   const DenseMap<Function *, Function *> &VectorizedFunctions;
 
-  BasicBlock *VecBB = nullptr;
+  BasicBlock *CurrentBB = nullptr;
 
   SmallVector<Value *, 8> Arguments;
+
+  enum class MaskMode {
+    Ignore,
+    Masked,
+    Unmasked,
+  };
 
   InstVectorizeVisitor(
       Function &VectorFunc,
@@ -91,15 +97,15 @@ struct InstVectorizeVisitor : InstVisitor<InstVectorizeVisitor> {
     }
   }
 
-  IRBuilder<> getBuilder() { return IRBuilder<>(VecBB); }
+  IRBuilder<> getBuilder() { return IRBuilder<>(CurrentBB); }
 
   void visitBasicBlock(BasicBlock &BB) {
     auto NewBB = BasicBlock::Create(Context, BB.getName(), &VectorFunc);
-    if (VecBB) {
+    if (CurrentBB) {
       getBuilder().CreateBr(NewBB);
     }
-    VecBB = NewBB;
-    BlockMap[&BB] = VecBB;
+    CurrentBB = NewBB;
+    BlockMap[&BB] = CurrentBB;
   }
 
   void visitInstruction(Instruction &I) {
@@ -114,7 +120,7 @@ struct InstVectorizeVisitor : InstVisitor<InstVectorizeVisitor> {
     // Previous steps ensure there's only one return per function.
     if (auto RetVal = Ret.getReturnValue()) {
       auto VecReturn = getBuilder().CreateRet(getVectorized(RetVal));
-      setVectorized(&Ret, VecReturn);
+      record(&Ret, VecReturn, MaskMode::Unmasked);
     } else {
       getBuilder().CreateRetVoid();
     }
@@ -126,6 +132,9 @@ struct InstVectorizeVisitor : InstVisitor<InstVectorizeVisitor> {
     }
     if (Alloca.isUsedWithInAlloca()) {
       report_fatal_error("TODO: support inalloca");
+    }
+    if (!Alloca.isStaticAlloca()) {
+      report_fatal_error("dynamic alloca not supported (yet)");
     }
 
     auto I32Ty = IntegerType::get(Context, 32);
@@ -141,7 +150,7 @@ struct InstVectorizeVisitor : InstVisitor<InstVectorizeVisitor> {
     auto VecAllocas = getBuilder().CreateGEP(
         Alloca.getAllocatedType(), WholeAlloca, ConstantVector::get(LaneIds));
 
-    setVectorized(&Alloca, VecAllocas, /* Conditional= */ true);
+    record(&Alloca, VecAllocas, MaskMode::Ignore);
   }
 
   void visitIntrinsicInst(IntrinsicInst &Call) {
@@ -157,8 +166,7 @@ struct InstVectorizeVisitor : InstVisitor<InstVectorizeVisitor> {
         LaneIds.push_back(ConstantInt::get(I32Ty, i));
       }
       // As this function is pure, ignoring the mask is OK.
-      setVectorized(&Call, ConstantVector::get(LaneIds),
-                    /* Conditional: */ true);
+      record(&Call, ConstantVector::get(LaneIds), MaskMode::Ignore);
       break;
     }
     case Intrinsic::lifetime_start:
@@ -176,111 +184,97 @@ struct InstVectorizeVisitor : InstVisitor<InstVectorizeVisitor> {
     case Intrinsic::expect:
       // TODO use these to guide linearization (and also branch weights, btw)
       // For now, just ignore the hint and use the value passed in
-      setVectorized(&Call, getVectorized(Call.getArgOperand(0)),
-                    /* Conditional: */ true /* FIXME this is wrong */);
+      record(&Call, getVectorized(Call.getArgOperand(0)), MaskMode::Ignore);
       break;
+    }
+  }
+
+  // Insert I in a new block conditional on Cond, like this:
+  //
+  //  +----------------------+ , original CurrentBB
+  //  |  ... current BB ...  |
+  //  | br %cond, %bb1, %bb2 |
+  //  +----------------------+
+  //     | true       | false
+  //     v            |
+  //  +------------+  | ; newly created BB
+  //  | %I = ...   |  |
+  //  +------------+  |
+  //     |            |
+  //     v            v
+  //  +-------------------------+ ; new CurrentBB
+  //  | %result = phi %I, undef |
+  //  |           ...           |
+  //
+  // The PHI is only created if %I has a non-void result.
+  // The PHI is returned in that case, nullptr otherwise.
+  //
+  Instruction *insertConditional(Value *Cond, Instruction *I,
+                                 const Twine &CondBlockName) {
+    assert(!I->getParent());
+    auto OldBB = CurrentBB;
+    auto CondBB = BasicBlock::Create(Context, CondBlockName, &VectorFunc);
+    auto NextBB =
+        BasicBlock::Create(Context, CurrentBB->getName(), &VectorFunc);
+
+    getBuilder().CreateCondBr(Cond, CondBB, NextBB);
+    IRBuilder<> CondBuilder(CondBB);
+    CondBuilder.Insert(I);
+    CondBuilder.CreateBr(NextBB);
+
+    CurrentBB = NextBB;
+    if (I->getType()->isVoidTy()) {
+      return nullptr;
+    } else {
+      auto Phi = getBuilder().CreatePHI(I->getType(), 2);
+      auto Undef = UndefValue::get(I->getType());
+      Phi->addIncoming(I, CondBB);
+      Phi->addIncoming(Undef, OldBB);
+      return Phi;
     }
   }
 
   void visitCallInst(CallInst &Call) {
     auto Callee = Call.getCalledFunction();
+    SmallVector<Value *, 4> VectorArgs;
+    for (auto &Arg : Call.arg_operands()) {
+      VectorArgs.push_back(getVectorized(&*Arg));
+    }
     if (auto VectorCallee = VectorizedFunctions.lookup(Callee)) {
-      SmallVector<Value *, 8> VectorArgs;
-      auto Mask = getVectorized(getCondition(&Call));
-      VectorArgs.push_back(Mask);
-      for (auto &Arg : Call.arg_operands()) {
-        VectorArgs.push_back(getVectorized(&*Arg));
-      }
+      auto Mask = requireMask(&Call);
+      VectorArgs.insert(VectorArgs.begin(), Mask);
       // Only do the call if any lanes need it. This can not only save
       // time for expensive functions, it also makes recursion work.
-      auto Builder = getBuilder();
       auto MaskIntTy = IntegerType::get(Context, SIMD_WIDTH);
-      auto MaskAsInt = Builder.CreateBitCast(Mask, MaskIntTy);
-      auto NeedCall = Builder.CreateICmpNE(
-          MaskAsInt, ConstantInt::get(MaskIntTy, 0), "need_call");
+      auto Builder = getBuilder();
+      auto NeedCall =
+          Builder.CreateICmpNE(Builder.CreateBitCast(Mask, MaskIntTy),
+                               ConstantInt::get(MaskIntTy, 0), "need_call");
 
-      auto CallBB =
-          BasicBlock::Create(Context, "call." + Callee->getName(), &VectorFunc);
-      IRBuilder<> CallBuilder(CallBB);
       // TODO transplant attributes as appropriate
       // (some, especially argument attributes, may not apply)
-      auto VectorCall = CallBuilder.CreateCall(VectorCallee, VectorArgs);
-
-      auto NextBB = BasicBlock::Create(Context, VecBB->getName(), &VectorFunc);
-      CallBuilder.CreateBr(NextBB);
-      Builder.CreateCondBr(NeedCall, CallBB, NextBB);
-
-      auto OldBB = VecBB;
-      auto RetTy = VectorCallee->getReturnType();
-      if (!RetTy->isVoidTy()) {
-        VecBB = NextBB;
-        auto Phi = getBuilder().CreatePHI(RetTy, 2);
-        auto Undef = UndefValue::get(RetTy);
-        Phi->addIncoming(VectorCall, CallBB);
-        Phi->addIncoming(Undef, OldBB);
-        setVectorized(&Call, Phi, /* Conditional: */ true);
-      } else {
-        VecBB = CallBB;
-        setVectorized(&Call, VectorCall, /* Conditional: */ true);
+      auto VectorCall = CallInst::Create(VectorCallee, VectorArgs);
+      if (auto Result = insertConditional(NeedCall, VectorCall,
+                                          "call." + Callee->getName())) {
+        record(&Call, Result, MaskMode::Masked);
       }
-      VecBB = NextBB;
     } else {
       // Slow path for functions that don't have vectorized versions
-      auto Mask = getVectorized(getCondition(&Call));
-      SmallVector<Value *, 4> VecArgs;
-      for (Use &Arg : Call.arg_operands()) {
-        VecArgs.push_back(getVectorized(&*Arg));
-      }
+      auto Mask = requireMask(&Call);
       SmallVector<Value *, SIMD_WIDTH> LaneResults;
       for (uint64_t i = 0; i < SIMD_WIDTH; ++i) {
-        LaneResults.push_back(createConditionalCall(Call, VecArgs, Mask, i));
+        auto MaskBit = getBuilder().CreateExtractElement(Mask, i);
+        SmallVector<Value *, 8> LaneArgs;
+        for (Value *VecArg : VectorArgs) {
+          LaneArgs.push_back(getBuilder().CreateExtractElement(VecArg, i));
+        }
+        auto LaneCall = CallInst::Create(Callee, LaneArgs);
+        LaneResults.push_back(
+            insertConditional(MaskBit, LaneCall, "call." + Callee->getName()));
       }
       if (!Call.getType()->isVoidTy()) {
-        setVectorized(&Call, assembleVector(&Call, LaneResults),
-                      /* Conditional: */ true);
+        record(&Call, assembleVector(&Call, LaneResults), MaskMode::Masked);
       }
-    }
-  }
-
-  Value *createConditionalCall(CallInst &Call,
-                               SmallVectorImpl<Value *> &VecArgs, Value *Mask,
-                               uint64_t lane) {
-    auto Callee = Call.getCalledFunction();
-    assert(Callee);
-
-    auto CondBB = BasicBlock::Create(Context, "maskedcall." + Callee->getName(),
-                                     &VectorFunc);
-    auto NewVecBB = BasicBlock::Create(Context, "linearized", &VectorFunc);
-    CondBB->moveAfter(VecBB);
-    NewVecBB->moveAfter(CondBB);
-
-    auto Condition = getBuilder().CreateExtractElement(Mask, lane);
-    BranchInst::Create(CondBB, NewVecBB, Condition, VecBB);
-    IRBuilder<> CondBuilder(CondBB);
-    SmallVector<Value *, 4> ExtractedArgs;
-    for (Value *VecArg : VecArgs) {
-      ExtractedArgs.push_back(CondBuilder.CreateExtractElement(VecArg, lane));
-    }
-    auto LaneResult =
-        CondBuilder.CreateCall(Callee, ExtractedArgs, Call.getName());
-    CondBuilder.CreateBr(NewVecBB);
-
-    auto PrevBB = VecBB;
-    VecBB = NewVecBB;
-
-    // As the instruction is now conditional, it does not dominate the following
-    // uses any more. But because we know the value is only used if the
-    // condition is met, we can insert a phi like this to fix that:
-    //   phi [ undef, CurrBB ], [ Replacement, CondBB ]
-    auto Type = Call.getType();
-    if (Type->isVoidTy()) {
-      return nullptr;
-    } else {
-      auto Phi = getBuilder().CreatePHI(Type, 2);
-      auto Undef = UndefValue::get(Type);
-      Phi->addIncoming(LaneResult, CondBB);
-      Phi->addIncoming(Undef, PrevBB);
-      return Phi;
     }
   }
 
@@ -289,21 +283,22 @@ struct InstVectorizeVisitor : InstVisitor<InstVectorizeVisitor> {
     auto RHS = getVectorized(Cmp.getOperand(1));
     auto VecCmp =
         CmpInst::Create(Cmp.getOpcode(), Cmp.getPredicate(), LHS, RHS);
-    setVectorized(&Cmp, VecCmp);
+    record(&Cmp, VecCmp, MaskMode::Unmasked);
   }
 
   void visitBinaryOperator(BinaryOperator &Op) {
     auto LHS = getVectorized(Op.getOperand(0));
     auto RHS = getVectorized(Op.getOperand(1));
     auto VecOp = BinaryOperator::Create(Op.getOpcode(), LHS, RHS);
-    setVectorized(&Op, VecOp);
+    // TODO division probably needs to be masked?
+    record(&Op, VecOp, MaskMode::Unmasked);
   }
 
   void visitCastInst(CastInst &Cast) {
     auto VecVal = getVectorized(Cast.getOperand(0));
     auto VecCast = CastInst::Create(Cast.getOpcode(), VecVal,
                                     getVectorType(Cast.getDestTy()));
-    setVectorized(&Cast, VecCast);
+    record(&Cast, VecCast, MaskMode::Unmasked);
   }
 
   void visitGetElementPtrInst(GetElementPtrInst &GEP) {
@@ -314,24 +309,28 @@ struct InstVectorizeVisitor : InstVisitor<InstVectorizeVisitor> {
     auto PtrVec = getVectorized(GEP.getPointerOperand());
     auto VecGEP =
         GetElementPtrInst::Create(GEP.getSourceElementType(), PtrVec, IdxList);
-    setVectorized(&GEP, VecGEP);
+    record(&GEP, VecGEP, MaskMode::Unmasked);
   }
 
   void visitLoadInst(LoadInst &Load) {
     auto PtrVec = getVectorized(Load.getOperand(0));
-    auto Mask = getVectorized(getCondition(&Load));
+    auto Mask = tryGetMask(&Load);
+    bool IsMasked = Mask != nullptr;
+    // TODO consider always masking loads even if they are save to speculate
+    if (!Mask) {
+      Mask = ConstantVector::getSplat(SIMD_WIDTH, getBuilder().getTrue());
+    }
     auto Gather =
         getBuilder().CreateMaskedGather(PtrVec, Load.getAlignment(), Mask);
-    setVectorized(&Load, Gather, /* Conditional= */ true);
+    record(&Load, Gather, IsMasked ? MaskMode::Masked : MaskMode::Unmasked);
   }
 
   void visitStoreInst(StoreInst &Store) {
     auto ValVec = getVectorized(Store.getOperand(0));
     auto PtrVec = getVectorized(Store.getOperand(1));
-    auto Mask = getVectorized(getCondition(&Store));
-    auto Scatter = getBuilder().CreateMaskedScatter(ValVec, PtrVec,
-                                                    Store.getAlignment(), Mask);
-    setVectorized(&Store, Scatter, /* Conditional= */ true);
+    auto Scatter = getBuilder().CreateMaskedScatter(
+        ValVec, PtrVec, Store.getAlignment(), requireMask(&Store));
+    record(&Store, Scatter, MaskMode::Masked /* TODO is this right? */);
   }
 
   void visitSelectInst(SelectInst &Sel) {
@@ -339,12 +338,20 @@ struct InstVectorizeVisitor : InstVisitor<InstVectorizeVisitor> {
     auto TrueVec = getVectorized(Sel.getTrueValue());
     auto FalseVec = getVectorized(Sel.getFalseValue());
     auto VecSel = SelectInst::Create(Mask, TrueVec, FalseVec);
-    setVectorized(&Sel, VecSel);
+    record(&Sel, VecSel, MaskMode::Unmasked);
   }
 
-  Value *getCondition(Instruction *I) {
+  Value *tryGetMask(Instruction *I) {
     if (auto MD = I->getMetadata(CONDITION_METADATA_ID)) {
-      return cast<ValueAsMetadata>(&*MD->getOperand(0))->getValue();
+      auto Cond = cast<ValueAsMetadata>(&*MD->getOperand(0))->getValue();
+      return getVectorized(Cond);
+    }
+    return nullptr;
+  }
+
+  Value *requireMask(Instruction *I) {
+    if (auto Mask = tryGetMask(I)) {
+      return Mask;
     } else {
       std::string msg;
       raw_string_ostream Msg(msg);
@@ -354,13 +361,17 @@ struct InstVectorizeVisitor : InstVisitor<InstVectorizeVisitor> {
     }
   }
 
-  void setVectorized(Instruction *Scalar, Value *Vectorized,
-                     bool Conditional = false) {
+  void record(Instruction *Scalar, Value *Vectorized, MaskMode Mode,
+              BasicBlock *BB = nullptr) {
     if (auto VecInst = dyn_cast<Instruction>(Vectorized)) {
-      if (!VecInst->getParent()) {
-        VecBB->getInstList().push_back(VecInst);
+      if (!BB) {
+        BB = CurrentBB;
+      }
+
+      if (VecInst->getParent()) {
+        assert(VecInst->getParent() == BB);
       } else {
-        assert(VecInst->getParent() == VecBB);
+        BB->getInstList().push_back(VecInst);
       }
     }
     Vectorized->setName(Scalar->getName());
@@ -371,12 +382,18 @@ struct InstVectorizeVisitor : InstVisitor<InstVectorizeVisitor> {
     DEBUG(Vectorized->print(dbgs()));
     DEBUG(dbgs() << "\n");
 
-    if (Conditional) {
-      assert(Scalar->getMetadata(CONDITION_METADATA_ID) &&
-             "Unconditional instruction masked");
-    } else {
+    switch (Mode) {
+    case MaskMode::Unmasked:
       assert(!Scalar->getMetadata(CONDITION_METADATA_ID) &&
-             "Conditional instruction not masked");
+             "Instruction supposedly masked, but has no condition");
+      break;
+    case MaskMode::Masked:
+      assert(Scalar->getMetadata(CONDITION_METADATA_ID) &&
+             "Instruction supposedly unmasked, but has condition");
+      break;
+    case MaskMode::Ignore:
+      /* Nothing */
+      break;
     }
     Scalar2Vector[Scalar] = Vectorized;
   }
@@ -423,7 +440,8 @@ struct FunctionVectorizer {
       : Context(F.getContext()), VectorFunc(&VF),
         VectorizedFunctions(VectorizedFunctions) {
     // We need to clone the source function at the very least to change the
-    // signature. But since we already have a copy, we also mangle that copy in-
+    // signature. But since we already have a copy, we also mangle that copy
+    // in-
     // place, which would be incorrect otherwise (scalar code could call it).
     ValueToValueMapTy ArgMapping;
     SmallVector<ReturnInst *, 1> Returns;
@@ -448,7 +466,8 @@ struct FunctionVectorizer {
   // Create an empty function with the same prototype as F, except that an
   // additional i1 argument (the condition for the entry block) is inserted
   // before the first argument.
-  // Also fills out a mapping from the input function's arguments to the output
+  // Also fills out a mapping from the input function's arguments to the
+  // output
   // function's arguments, for CloneFunctionInto
   Function *prepareScalarFunction(Function &F, ValueToValueMapTy &ArgMapping) {
     SmallVector<Type *, 8> ArgsPlusCond;
@@ -494,7 +513,8 @@ struct FunctionVectorizer {
       }
       if (!Cond) {
         assert(&BB == &LinearFunc->getEntryBlock() && "unreachable block");
-        // The condition for the entry block is passed in as the first argument,
+        // The condition for the entry block is passed in as the first
+        // argument,
         Cond = &*LinearFunc->arg_begin();
       }
       assert(Cond->getType() == IntegerType::get(Context, 1));
@@ -632,10 +652,6 @@ struct FunctionVectorizer {
           I->eraseFromParent();
         } else {
           if (!isSafeToSpeculativelyExecute(I)) {
-            markAsConditional(I, BlockCond);
-          }
-          // HACK should support unmasked gather/scatter and intrinsic calls
-          else if (isa<LoadInst>(I) || isa<StoreInst>(I) || isa<CallInst>(I)) {
             markAsConditional(I, BlockCond);
           }
           I->removeFromParent();
