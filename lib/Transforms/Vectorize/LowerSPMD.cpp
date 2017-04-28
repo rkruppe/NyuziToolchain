@@ -1,5 +1,6 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/PostOrderIterator.h"
+#include "llvm/ADT/SCCIterator.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/ValueTracking.h"
@@ -71,11 +72,13 @@ struct Conditions {
 };
 
 struct InstVectorizeVisitor : InstVisitor<InstVectorizeVisitor> {
-  LLVMContext &Context;
   Function &VectorFunc;
-  DenseMap<Instruction *, Value *> Scalar2Vector;
-  DenseMap<BasicBlock *, BasicBlock *> BlockMap;
+  LLVMContext &Context;
+  const LoopInfo &LI;
   const DenseMap<Function *, Function *> &VectorizedFunctions;
+
+  DenseMap<Instruction *, Value *> Scalar2Vector;
+  BBMap<BasicBlock *> BlockMap;
 
   BasicBlock *CurrentBB = nullptr;
 
@@ -88,9 +91,9 @@ struct InstVectorizeVisitor : InstVisitor<InstVectorizeVisitor> {
   };
 
   InstVectorizeVisitor(
-      Function &VectorFunc,
+      Function &VectorFunc, const LoopInfo &LI,
       const DenseMap<Function *, Function *> &VectorizedFunctions)
-      : Context(VectorFunc.getContext()), VectorFunc(VectorFunc),
+      : VectorFunc(VectorFunc), Context(VectorFunc.getContext()), LI(LI),
         VectorizedFunctions(VectorizedFunctions) {
     for (auto &Arg : VectorFunc.args()) {
       Arguments.push_back(&Arg);
@@ -99,14 +102,13 @@ struct InstVectorizeVisitor : InstVisitor<InstVectorizeVisitor> {
 
   IRBuilder<> getBuilder() { return IRBuilder<>(CurrentBB); }
 
-  void visitBasicBlock(BasicBlock &BB) {
-    auto NewBB = BasicBlock::Create(Context, BB.getName(), &VectorFunc);
-    if (CurrentBB) {
-      getBuilder().CreateBr(NewBB);
+  void visitFunction(Function &F) {
+    for (auto &BB : F) {
+      BlockMap[&BB] = BasicBlock::Create(Context, BB.getName(), &VectorFunc);
     }
-    CurrentBB = NewBB;
-    BlockMap[&BB] = CurrentBB;
   }
+
+  void visitBasicBlock(BasicBlock &BB) { CurrentBB = BlockMap[&BB]; }
 
   void visitInstruction(Instruction &I) {
     std::string msg;
@@ -341,6 +343,28 @@ struct InstVectorizeVisitor : InstVisitor<InstVectorizeVisitor> {
     record(&Sel, VecSel, MaskMode::Unmasked);
   }
 
+  void visitPHINode(PHINode &Phi) {
+    // assert(LI.isLoopHeader(Phi.getParent()) && Phi.getType()->isIntegerTy(1)
+    // &&
+    //       "Vectorizing PHI that does not seem to be a loop mask");
+    // Since this ought to be a loop mask, there is nothing to vectorize
+    auto NewPhi = getBuilder().CreatePHI(getVectorType(Phi.getType()),
+                                         Phi.getNumIncomingValues());
+    for (unsigned i = 0; i < Phi.getNumIncomingValues(); ++i) {
+      auto VecIncoming = getVectorized(Phi.getIncomingValue(i));
+      NewPhi->addIncoming(VecIncoming, BlockMap[Phi.getIncomingBlock(i)]);
+    }
+    record(&Phi, NewPhi, MaskMode::Ignore);
+  }
+
+  void visitBranchInst(BranchInst &Br) {
+    // As we're post-linearization, there is nothing to vectorize.
+    assert(!Br.isConditional() && "TODO need to support this for loops");
+    auto VecTarget = BlockMap[Br.getSuccessor(0)];
+    auto Br2 = getBuilder().CreateBr(VecTarget);
+    record(&Br, Br2, MaskMode::Ignore);
+  }
+
   Value *tryGetMask(Instruction *I) {
     if (auto MD = I->getMetadata(CONDITION_METADATA_ID)) {
       auto Cond = cast<ValueAsMetadata>(&*MD->getOperand(0))->getValue();
@@ -400,7 +424,9 @@ struct InstVectorizeVisitor : InstVisitor<InstVectorizeVisitor> {
 
   Value *getVectorized(Value *Scalar) {
     if (auto I = dyn_cast<Instruction>(Scalar)) {
-      assert(Scalar2Vector.count(I));
+      // assert(Scalar2Vector.count(I));
+      if (!Scalar2Vector.count(I))
+        return UndefValue::get(getVectorType(Scalar->getType())); // XXX
       return Scalar2Vector[I];
     } else if (auto Arg = dyn_cast<Argument>(Scalar)) {
       return Arguments[Arg->getArgNo()];
@@ -426,12 +452,119 @@ struct InstVectorizeVisitor : InstVisitor<InstVectorizeVisitor> {
   }
 };
 
+struct Linearizer {
+  Conditions &Conds;
+  Function *F;
+  LLVMContext &Context;
+  BasicBlock *LastBB = nullptr;
+  ReturnInst *SoleReturn = nullptr;
+
+  Linearizer(Conditions &Conds, Function *F)
+      : Conds(Conds), F(F), Context(F->getContext()) {}
+
+  // Duplicates scc_iterator::hasLoop, but for various reasons this class
+  // can't work with those iterators directly
+  bool hasLoop(const std::vector<BasicBlock *> &SCC) {
+    if (SCC.size() > 1) {
+      return true;
+    }
+    auto BB = SCC[0];
+    auto Succs = successors(BB);
+    return std::any_of(Succs.begin(), Succs.end(),
+                       [&](BasicBlock *Succ) { return Succ == BB; });
+  }
+
+  void visitSCC(const std::vector<BasicBlock *> &SCC) {
+    if (hasLoop(SCC)) {
+      visitLoop(SCC);
+    } else {
+      visitSingleBlock(SCC[0]);
+    }
+  }
+
+  void visitSingleBlock(BasicBlock *BB) {
+    auto BlockCond = Conds.forBlock(BB);
+
+    if (LastBB) {
+      IRBuilder<> Builder(LastBB);
+      Builder.CreateBr(BB);
+    }
+    LastBB = BB;
+    for (auto Iter = BB->begin(); Iter != BB->end();) {
+      Instruction *I = &*Iter;
+      ++Iter;
+      if (auto *Phi = dyn_cast<PHINode>(I)) {
+        if (Phi != Conds.forBlock(BB)) // XXX
+          PhiToSelect(Phi);
+      } else if (auto Ret = dyn_cast<ReturnInst>(I)) {
+        // The constructor ensured there's only one return.
+        // Because of unreachable instructions, the BB with the return may not
+        // be last in the topological order, so to ensure the return is at the
+        // end of the linearized function we remember it and put it at the very
+        // end after we've visited all BBs.
+        assert(!SoleReturn);
+        SoleReturn = Ret;
+        I->removeFromParent();
+      } else if (isa<TerminatorInst>(I)) {
+        I->eraseFromParent();
+      } else if (!isSafeToSpeculativelyExecute(I)) {
+        markAsConditional(I, BlockCond);
+      }
+    }
+  }
+
+  void visitLoop(const std::vector<BasicBlock *> &SCC) {
+    visitSingleBlock(SCC[0]);
+  }
+
+  void markAsConditional(Instruction *Inst, Value *Condition) {
+    assert(!Inst->getMetadata(CONDITION_METADATA_ID) &&
+           "Instruction already conditional");
+    auto CondMD = ValueAsMetadata::get(Condition);
+    Inst->setMetadata(CONDITION_METADATA_ID, MDNode::get(Context, CondMD));
+  }
+
+  void PhiToSelect(PHINode *Phi) {
+    auto Result = Phi->getIncomingValue(0);
+    auto BB = Phi->getParent();
+    auto Cond = Conds.forEdge(Phi->getIncomingBlock(0), BB);
+    IRBuilder<> Builder(Phi);
+    for (unsigned i = 1; i < Phi->getNumIncomingValues(); ++i) {
+      Result = Builder.CreateSelect(Cond, Result, Phi->getIncomingValue(i),
+                                    Phi->getName());
+      Cond = Conds.forEdge(Phi->getIncomingBlock(i), BB);
+    }
+    Phi->replaceAllUsesWith(Result);
+    Phi->eraseFromParent();
+  }
+
+  void finish() {
+    assert(SoleReturn);
+    assert(LastBB);
+    LastBB->getInstList().push_back(SoleReturn);
+  }
+};
+
+// Whether the use is across loop boundaries (including loop *iterations*).
+bool isCrossLoopUse(Loop *L, Use &U) {
+  if (auto Phi = dyn_cast<PHINode>(U.getUser())) {
+    // Uses across loop *iterations* must happen in a phi in the loop *header*:
+    // (1) It must be a phi, because defs from earlier iterations don't dominate
+    // uses in later iterations.
+    // (2) The phi must be in the loop header, as phis *within* the loop can't
+    // distinguish between the loop back edge and other edges entering the loop.
+    return Phi->getParent() == L->getHeader();
+  }
+  // The only other way to have a use across loop boundaries is to
+  // use the def *outside* the loop, which we can query directly.
+  return !L->contains(cast<Instruction>(U.getUser()));
+}
+
 struct FunctionVectorizer {
   LLVMContext &Context;
   Function *LinearFunc;
   Function *VectorFunc;
   const DenseMap<Function *, Function *> &VectorizedFunctions;
-  DominatorTree DomTree;
   LoopInfo LI;
 
   FunctionVectorizer(
@@ -439,10 +572,12 @@ struct FunctionVectorizer {
       const DenseMap<Function *, Function *> &VectorizedFunctions)
       : Context(F.getContext()), VectorFunc(&VF),
         VectorizedFunctions(VectorizedFunctions) {
-    // We need to clone the source function at the very least to change the
-    // signature. But since we already have a copy, we also mangle that copy
-    // in-
-    // place, which would be incorrect otherwise (scalar code could call it).
+    // We need to clone the source function already before mask computation to
+    // insert the i1 argument (the condition for the entry block). We then
+    // linearize that copy in-place. Vectorization, however, creates a new
+    // function (it can't easily work in-place because the types of all
+    // instructions change).
+    // TODO find a better name than "LinearFunc"
     ValueToValueMapTy ArgMapping;
     SmallVector<ReturnInst *, 1> Returns;
     LinearFunc = prepareScalarFunction(F, ArgMapping);
@@ -454,13 +589,32 @@ struct FunctionVectorizer {
                          "returns, run mergereturn");
     }
 
-    DomTree = DominatorTree(*LinearFunc);
+    DominatorTree DomTree(*LinearFunc);
     LI = LoopInfo(DomTree);
     if (!LI.empty()) {
       DEBUG(LI.print(dbgs()));
+      for (Loop *L : LI) {
+        DEBUG(L->dumpVerbose());
+        DEBUG(dbgs() << "Loop live values for " << L->getName() << ":\n");
+        for (auto LLV : loopLiveValues(L)) {
+          DEBUG(LLV->dump());
+        }
+      }
       DEBUG(dbgs() << '\n');
-      report_fatal_error("TODO support loops");
     }
+  }
+
+  DenseSet<Instruction *> loopLiveValues(Loop *L) {
+    DenseSet<Instruction *> LiveValues;
+    for (auto BB : L->blocks()) {
+      for (auto &I : *BB) {
+        if (std::any_of(I.use_begin(), I.use_end(),
+                        [=](Use &U) { return isCrossLoopUse(L, U); })) {
+          LiveValues.insert(&I);
+        }
+      }
+    }
+    return LiveValues;
   }
 
   // Create an empty function with the same prototype as F, except that an
@@ -493,32 +647,40 @@ struct FunctionVectorizer {
 
   void createBlockConditions(Conditions &Conds) {
     BBMap<Value *> PlaceholderConds = Conds.ForBlock;
-    BBMap<std::vector<Value *>> IncomingConds;
-    for (auto &From : *LinearFunc) {
-      for (auto KVPair : Conds.ForEdge[&From]) {
-        BasicBlock &To = *KVPair.getFirst();
-        IncomingConds[&To].push_back(Conds.ForEdge[&From][&To]);
-      }
-    }
 
     for (BasicBlock &BB : *LinearFunc) {
       IRBuilder<> Builder(&BB, BB.getFirstInsertionPt());
-      Value *Cond = nullptr;
-      for (Value *IncomingCond : IncomingConds[&BB]) {
-        if (!Cond) {
-          Cond = IncomingCond;
-        } else {
-          Cond = Builder.CreateOr(Cond, IncomingCond, BB.getName() + ".exec");
+      Value *BlockCond = nullptr;
+      if (LI.isLoopHeader(&BB)) {
+        // The phi we're inserting will *not* be converted into a select later
+        // on, so we make sure it's *before* those other phi nodes.
+        Builder.SetInsertPoint(&BB, BB.begin());
+        auto Phi = Builder.CreatePHI(Builder.getInt1Ty(),
+                                     2 /* TODO this is a guess */);
+        for (auto Pred : predecessors(&BB)) {
+          Phi->addIncoming(Conds.forEdge(Pred, &BB), Pred);
+        }
+        Phi->setName(BB.getName() + ".exec");
+        BlockCond = Phi;
+      } else {
+        for (auto Pred : predecessors(&BB)) {
+          auto IncomingCond = Conds.forEdge(Pred, &BB);
+          if (!BlockCond) {
+            BlockCond = IncomingCond;
+          } else {
+            BlockCond = Builder.CreateOr(BlockCond, IncomingCond,
+                                         BB.getName() + ".exec");
+          }
         }
       }
-      if (!Cond) {
+      if (!BlockCond) {
         assert(&BB == &LinearFunc->getEntryBlock() && "unreachable block");
         // The condition for the entry block is passed in as the first
         // argument,
-        Cond = &*LinearFunc->arg_begin();
+        BlockCond = &*LinearFunc->arg_begin();
       }
-      assert(Cond->getType() == IntegerType::get(Context, 1));
-      Conds.forBlock(&BB) = Cond;
+      assert(BlockCond->getType() == Builder.getInt1Ty());
+      Conds.forBlock(&BB) = BlockCond;
     }
 
     // Some of the edge conditions are block condition placeholders,
@@ -604,71 +766,26 @@ struct FunctionVectorizer {
     }
   }
 
-  void markAsConditional(Instruction *Inst, Value *Condition) {
-    assert(!Inst->getMetadata(CONDITION_METADATA_ID) &&
-           "Instruction already conditional");
-    auto CondMD = ValueAsMetadata::get(Condition);
-    Inst->setMetadata(CONDITION_METADATA_ID, MDNode::get(Context, CondMD));
-  }
-
-  void PhiToSelect(PHINode *Phi, Conditions &Conds, BasicBlock *OldBB,
-                   BasicBlock *LinearBB) {
-    auto Result = Phi->getIncomingValue(0);
-    auto Cond = Conds.forEdge(Phi->getIncomingBlock(0), OldBB);
-    IRBuilder<> Builder(LinearBB);
-    for (unsigned i = 1; i < Phi->getNumIncomingValues(); ++i) {
-      Result = Builder.CreateSelect(Cond, Result, Phi->getIncomingValue(i),
-                                    Phi->getName());
-      Cond = Conds.forEdge(Phi->getIncomingBlock(i), OldBB);
-    }
-    Phi->replaceAllUsesWith(Result);
-    Phi->eraseFromParent();
-  }
-
   void linearizeCFG(Conditions &Conds) {
-    ReversePostOrderTraversal<Function *> RPOT(LinearFunc);
-    std::vector<BasicBlock *> BBsInTopologicalOrder(RPOT.begin(), RPOT.end());
-
-    auto *LinearBB = BasicBlock::Create(Context, "linearized", LinearFunc,
-                                        &LinearFunc->getEntryBlock());
-    Instruction *Return = nullptr;
-
-    for (auto SourceBB : BBsInTopologicalOrder) {
-      auto BlockCond = Conds.forBlock(SourceBB);
-      while (!SourceBB->empty()) {
-        Instruction *I = &SourceBB->front();
-        if (auto *Phi = dyn_cast<PHINode>(I)) {
-          PhiToSelect(Phi, Conds, SourceBB, LinearBB);
-        } else if (isa<ReturnInst>(I)) {
-          // The constructor ensured there's only one return.
-          // Because of unreachable instructions, the BB with the return
-          // may not be last in the topological order, so to ensure
-          // the return is at the end of the linearized function we remember
-          // it and put it at the very end after we've visited all BBs.
-          assert(!Return);
-          Return = I;
-          I->removeFromParent();
-        } else if (isa<TerminatorInst>(I)) {
-          I->eraseFromParent();
-        } else {
-          if (!isSafeToSpeculativelyExecute(I)) {
-            markAsConditional(I, BlockCond);
-          }
-          I->removeFromParent();
-          LinearBB->getInstList().push_back(I);
-        }
+    std::vector<std::vector<BasicBlock *>> SCCBBs;
+    for (auto I = scc_begin(LinearFunc); !I.isAtEnd(); ++I) {
+      DEBUG(dbgs() << "SCC: ");
+      for (auto BB : *I) {
+        DEBUG(dbgs() << BB->getName() << "@" << BB << " ");
       }
+      DEBUG(dbgs() << "\n");
+      SCCBBs.push_back(*I);
+    }
+    // XXX scc_iterator on the Inverse graph doesn't seem to work?!
+    std::reverse(SCCBBs.begin(), SCCBBs.end());
+
+    Linearizer Lin(Conds, LinearFunc);
+
+    for (auto const &SCC : SCCBBs) {
+      Lin.visitSCC(SCC);
     }
 
-    assert(Return);
-    LinearBB->getInstList().push_back(Return);
-
-    // We're turning phis into selects on the fly, so we can't
-    // remove BBs in the loop since we might access them while
-    // processing later phis.
-    for (auto BB : BBsInTopologicalOrder) {
-      BB->eraseFromParent();
-    }
+    Lin.finish();
   }
 
   Function *run() {
@@ -699,7 +816,7 @@ struct FunctionVectorizer {
     DEBUG(LinearFunc->print(dbgs()));
 
     DEBUG(dbgs() << "===================================================\n");
-    InstVectorizeVisitor IVV(*VectorFunc, VectorizedFunctions);
+    InstVectorizeVisitor IVV(*VectorFunc, LI, VectorizedFunctions);
     IVV.visit(*LinearFunc);
 
     LinearFunc->eraseFromParent();
