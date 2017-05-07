@@ -11,6 +11,7 @@
 #include "llvm/IR/Module.h"
 #include "llvm/Pass.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Transforms/Utils/LoopUtils.h"
 using namespace llvm;
@@ -24,26 +25,45 @@ const char *CONDITION_METADATA_ID = "spmd-conditional";
 
 template <typename T> using BBMap = DenseMap<BasicBlock *, T>;
 
-struct Conditions {
+class ConditionTable {
+  using VH = TrackingVH<Value>;
+  // For each BB, stores an i1 that is true iff the block is executed (although
+  // it is computed in the block itself). For loop headers, this is a  "loop
+  // conditions" which is true iff the loop is still running.
+  BBMap<VH> BlockConditions;
+
+  // For each pair of blocks (BB1, BB2) that have an edge between them, stores
+  // an i1 that is true iff there was a jump from BB1 to BB2. This may be a
+  // combination of the branch condition and the source block's condition, or a
+  // loop exit mask.
+  // FIXME the representation is fine, but the mask generation will fall apart
+  // if there are multiple edges between two blocks. Other code may also be
+  // rewritten to support this.
+  BBMap<BBMap<VH>> JumpConditions;
+
   Function &F;
-  BBMap<Value *> ForBlock;
-  BBMap<BBMap<Value *>> ForEdge;
 
-  Conditions(Function &F) : F(F) {}
+public:
+  ConditionTable(Function &F) : F(F) {}
 
-  void addEdge(BasicBlock *From, BasicBlock *To, Value *Cond) {
-    assert(ForEdge[From].count(To) == 0 && "Added edge twice");
-    ForEdge[From][To] = Cond;
+  void addBlock(BasicBlock *BB, Value *Cond) {
+    assert(BlockConditions.count(BB) == 0 && "Added block twice");
+    BlockConditions[BB] = Cond;
   }
 
-  Value *&forBlock(BasicBlock *BB) {
-    assert(BB->getParent() == &F && "query for BB from wrong function");
-    return ForBlock[BB];
+  void addJump(BasicBlock *From, BasicBlock *To, Value *Cond) {
+    assert(JumpConditions[From].count(To) == 0 && "Added edge twice");
+    JumpConditions[From][To] = Cond;
   }
-  Value *forEdge(BasicBlock *From, BasicBlock *To) {
-    assert(From->getParent() == &F && "query for BB from wrong function");
-    assert(To->getParent() == &F && "query for BB from wrong function");
-    return ForEdge[From][To];
+
+  Value *blockCondition(BasicBlock *BB) const {
+    assert(BlockConditions.count(BB) && "Unknown block");
+    return BlockConditions.lookup(BB);
+  }
+
+  Value *jumpCondition(BasicBlock *From, BasicBlock *To) const {
+    assert(JumpConditions.lookup(From).count(To) && "Unknown jump");
+    return JumpConditions.lookup(From).lookup(To);
   }
 
   void print(raw_ostream &os) {
@@ -56,20 +76,136 @@ struct Conditions {
     };
     for (BasicBlock &BB : F) {
       os << "Block condition " << BB.getName() << ": ";
-      Dump(ForBlock[&BB]);
+      Dump(BlockConditions[&BB]);
     }
     for (auto &From : F) {
       for (auto &To : F) {
-        if (ForEdge[&From].count(&To) == 0) {
+        if (JumpConditions[&From].count(&To) == 0) {
           continue;
         }
-        os << "Edge condition " << From.getName() << " -> " << To.getName()
+        os << "Jump condition " << From.getName() << " -> " << To.getName()
            << ": ";
-        Dump(ForEdge[&From][&To]);
+        Dump(JumpConditions[&From][&To]);
       }
     }
   }
 };
+
+bool isLoopExit(BasicBlock *From, BasicBlock *To, LoopInfo &LI) {
+  return LI.getLoopDepth(From) > LI.getLoopDepth(To);
+}
+
+void createJumpCondition(BasicBlock *From, BasicBlock *To, Value *Cond,
+                         ConditionTable &CT, LoopInfo &LI) {
+  DEBUG(dbgs() << "Jump " << From->getName() << " -> " << To->getName()
+               << " with condition: " << *Cond << "\n");
+  if (Cond->getName().empty()) {
+    Cond->setName(From->getName() + ".to." + To->getName());
+  }
+  if (isLoopExit(From, To, LI)) {
+    // Create (1) an "update operation" at the exit that ORs the condition for
+    // the actual jump with (2) a phi in the loop header that preserves the exit
+    // condition from the previous iteration.
+    // (1) becomes the real jump condition.
+
+    Loop *L = LI.getLoopFor(From);
+    // First create the phi, it's needed for (1) and filled in later.
+    IRBuilder<> PhiBuilder(&L->getHeader()->front());
+    auto Phi = PhiBuilder.CreatePHI(PhiBuilder.getInt1Ty(), 2);
+
+    IRBuilder<> UpdateBuilder(From->getTerminator());
+    Cond = UpdateBuilder.CreateOr(Phi, Cond);
+
+    // Now fill in the phi
+    Phi->addIncoming(Cond, L->getLoopLatch());
+    // TODO for nested loops, the pre-header needs a different incoming value
+    assert(LI.getLoopDepth(From) == LI.getLoopDepth(To) + 1 &&
+           "TODO support breaking out of multiple loops");
+    Phi->addIncoming(PhiBuilder.getFalse(), L->getLoopPreheader());
+  }
+  CT.addJump(From, To, Cond);
+}
+
+void createJumpConditionsFrom(BasicBlock *BB, ConditionTable &CT,
+                              LoopInfo &LI) {
+  auto *BlockCond = CT.blockCondition(BB);
+  auto *Terminator = BB->getTerminator();
+  if (isa<UnreachableInst>(Terminator) || isa<ReturnInst>(Terminator)) {
+    // No successors => nothing to do.
+    return;
+  }
+  auto *Br = cast<BranchInst>(Terminator);
+  // TODO check up-front whether all terminators are unreachable/return/br
+  if (Br->isConditional()) {
+    IRBuilder<> Builder(Br);
+    auto *Cond0 = Br->getCondition();
+    auto *Cond1 = Builder.CreateNot(Cond0, "not." + Cond0->getName());
+    createJumpCondition(BB, Br->getSuccessor(0),
+                        Builder.CreateAnd(BlockCond, Cond0), CT, LI);
+    createJumpCondition(BB, Br->getSuccessor(1),
+                        Builder.CreateAnd(BlockCond, Cond1), CT, LI);
+  } else {
+    // Single successor => just re-use the block condition.
+    createJumpCondition(BB, Br->getSuccessor(0), BlockCond, CT, LI);
+  }
+}
+
+Value *createBlockCondition(BasicBlock *BB, const ConditionTable &CT,
+                            LoopInfo &LI) {
+  IRBuilder<> Builder(BB, BB->getFirstInsertionPt());
+  Value *Cond = nullptr;
+  if (LI.isLoopHeader(BB)) {
+    auto Phi = Builder.CreatePHI(Builder.getInt1Ty(), 2);
+    for (auto Pred : predecessors(BB)) {
+      Phi->addIncoming(CT.jumpCondition(Pred, BB), Pred);
+    }
+    Cond = Phi;
+  } else {
+    for (auto Pred : predecessors(BB)) {
+      auto JumpCond = CT.jumpCondition(Pred, BB);
+      Cond = Cond ? Builder.CreateOr(Cond, JumpCond) : JumpCond;
+    }
+  }
+  if (!Cond) {
+    auto F = BB->getParent();
+    assert(BB == &F->getEntryBlock() && "unreachable block");
+    // The entry block condition is pass in as first argument.
+    Cond = &*F->arg_begin();
+  }
+  Cond->setName(BB->getName() + ".exec");
+  assert(Cond->getType() == Builder.getInt1Ty());
+  return Cond;
+}
+
+ConditionTable createConditions(Function &F, LoopInfo &LI) {
+  ConditionTable CT(F);
+
+  // There are cyclic dependencies between block and jump conditions, so we
+  // break the cycle by introducing placeholders for the block conditions which
+  // are later RAUW'd the real block conditions.
+  Value *False = ConstantInt::getFalse(F.getContext());
+  for (auto &BB : F) {
+    Instruction *ip = &*BB.getFirstInsertionPt();
+    Instruction *Placeholder =
+        BinaryOperator::Create(BinaryOperator::Or, False, False,
+                               "exec.placeholder." + BB.getName(), ip);
+    CT.addBlock(&BB, Placeholder);
+  }
+
+  // Now we create the jump conditions, including loop exit conditions
+  for (auto &BB : F) {
+    createJumpConditionsFrom(&BB, CT, LI);
+  }
+
+  for (auto &BB : F) {
+    auto Placeholder = cast<Instruction>(CT.blockCondition(&BB));
+    auto RealBlockCond = createBlockCondition(&BB, CT, LI);
+    Placeholder->replaceAllUsesWith(RealBlockCond);
+    Placeholder->eraseFromParent();
+  }
+
+  return CT;
+}
 
 struct InstVectorizeVisitor : InstVisitor<InstVectorizeVisitor> {
   Function &VectorFunc;
@@ -122,7 +258,7 @@ struct InstVectorizeVisitor : InstVisitor<InstVectorizeVisitor> {
     // Previous steps ensure there's only one return per function.
     if (auto RetVal = Ret.getReturnValue()) {
       auto VecReturn = getBuilder().CreateRet(getVectorized(RetVal));
-      record(&Ret, VecReturn, MaskMode::Unmasked);
+      record(&Ret, VecReturn, MaskMode::Ignore);
     } else {
       getBuilder().CreateRetVoid();
     }
@@ -344,25 +480,41 @@ struct InstVectorizeVisitor : InstVisitor<InstVectorizeVisitor> {
   }
 
   void visitPHINode(PHINode &Phi) {
-    // assert(LI.isLoopHeader(Phi.getParent()) && Phi.getType()->isIntegerTy(1)
-    // &&
-    //       "Vectorizing PHI that does not seem to be a loop mask");
-    // Since this ought to be a loop mask, there is nothing to vectorize
-    auto NewPhi = getBuilder().CreatePHI(getVectorType(Phi.getType()),
+    assert(LI.isLoopHeader(Phi.getParent()));
+    // Because this is a loop, many incoming values aren't vectorized already.
+    // So we don't attempt to lift the incoming values just yet, instead waiting
+    // until we encounter the terminator of the loop latch.
+    auto VecPhi = getBuilder().CreatePHI(getVectorType(Phi.getType()),
                                          Phi.getNumIncomingValues());
-    for (unsigned i = 0; i < Phi.getNumIncomingValues(); ++i) {
-      auto VecIncoming = getVectorized(Phi.getIncomingValue(i));
-      NewPhi->addIncoming(VecIncoming, BlockMap[Phi.getIncomingBlock(i)]);
-    }
-    record(&Phi, NewPhi, MaskMode::Ignore);
+    record(&Phi, VecPhi, MaskMode::Ignore);
   }
 
   void visitBranchInst(BranchInst &Br) {
-    // As we're post-linearization, there is nothing to vectorize.
-    assert(!Br.isConditional() && "TODO need to support this for loops");
-    auto VecTarget = BlockMap[Br.getSuccessor(0)];
-    auto Br2 = getBuilder().CreateBr(VecTarget);
-    record(&Br, Br2, MaskMode::Ignore);
+    if (Br.isConditional()) {
+      Loop *L = LI.getLoopFor(Br.getParent());
+      assert(L && L->getLoopLatch() == Br.getParent() &&
+             "conditional branch outside loop latch post-linearization");
+      auto LoopMask = getVectorized(Br.getCondition());
+      auto Builder = getBuilder();
+      // During linearization, loop latches were canonicalized so that the back
+      // edge is taken if the condition is true. So if any bit of the mask is
+      // true, we need another iteration.
+      auto MaskIntTy = Builder.getIntNTy(SIMD_WIDTH);
+      auto LoopMaskInt = Builder.CreateBitCast(LoopMask, MaskIntTy);
+      auto AnyLaneContinues =
+          Builder.CreateICmpNE(LoopMaskInt, ConstantInt::get(MaskIntTy, 0));
+      auto VecHeader = BlockMap[Br.getSuccessor(0)],
+           VecExit = BlockMap[Br.getSuccessor(1)];
+      auto VecBr = Builder.CreateCondBr(AnyLaneContinues, VecHeader, VecExit);
+      record(&Br, VecBr, MaskMode::Ignore);
+      // Since we're finished with the loop now, we can also go back and fill in
+      // the phis at the start of the loop.
+      fixupPhis(*L->getHeader());
+    } else {
+      auto VecTarget = BlockMap[Br.getSuccessor(0)];
+      auto Br2 = getBuilder().CreateBr(VecTarget);
+      record(&Br, Br2, MaskMode::Ignore);
+    }
   }
 
   Value *tryGetMask(Instruction *I) {
@@ -450,100 +602,117 @@ struct InstVectorizeVisitor : InstVisitor<InstVectorizeVisitor> {
     }
     return Vector;
   }
-};
 
-struct Linearizer {
-  Conditions &Conds;
-  Function *F;
-  LLVMContext &Context;
-  BasicBlock *LastBB = nullptr;
-  ReturnInst *SoleReturn = nullptr;
-
-  Linearizer(Conditions &Conds, Function *F)
-      : Conds(Conds), F(F), Context(F->getContext()) {}
-
-  // Duplicates scc_iterator::hasLoop, but for various reasons this class
-  // can't work with those iterators directly
-  bool hasLoop(const std::vector<BasicBlock *> &SCC) {
-    if (SCC.size() > 1) {
-      return true;
-    }
-    auto BB = SCC[0];
-    auto Succs = successors(BB);
-    return std::any_of(Succs.begin(), Succs.end(),
-                       [&](BasicBlock *Succ) { return Succ == BB; });
-  }
-
-  void visitSCC(const std::vector<BasicBlock *> &SCC) {
-    if (hasLoop(SCC)) {
-      visitLoop(SCC);
-    } else {
-      visitSingleBlock(SCC[0]);
-    }
-  }
-
-  void visitSingleBlock(BasicBlock *BB) {
-    auto BlockCond = Conds.forBlock(BB);
-
-    if (LastBB) {
-      IRBuilder<> Builder(LastBB);
-      Builder.CreateBr(BB);
-    }
-    LastBB = BB;
-    for (auto Iter = BB->begin(); Iter != BB->end();) {
-      Instruction *I = &*Iter;
-      ++Iter;
-      if (auto *Phi = dyn_cast<PHINode>(I)) {
-        if (Phi != Conds.forBlock(BB)) // XXX
-          PhiToSelect(Phi);
-      } else if (auto Ret = dyn_cast<ReturnInst>(I)) {
-        // The constructor ensured there's only one return.
-        // Because of unreachable instructions, the BB with the return may not
-        // be last in the topological order, so to ensure the return is at the
-        // end of the linearized function we remember it and put it at the very
-        // end after we've visited all BBs.
-        assert(!SoleReturn);
-        SoleReturn = Ret;
-        I->removeFromParent();
-      } else if (isa<TerminatorInst>(I)) {
-        I->eraseFromParent();
-      } else if (!isSafeToSpeculativelyExecute(I)) {
-        markAsConditional(I, BlockCond);
+  void fixupPhis(BasicBlock &BB) {
+    for (Instruction &I : BB) {
+      auto Phi = dyn_cast<PHINode>(&I);
+      // All phis are at the start, so if we can stop at the first non-phi.
+      if (!Phi) {
+        break;
+      }
+      auto VecPhi = cast<PHINode>(getVectorized(Phi));
+      for (unsigned i = 0; i < Phi->getNumIncomingValues(); ++i) {
+        auto VecIncoming = getVectorized(Phi->getIncomingValue(i));
+        VecPhi->addIncoming(VecIncoming, BlockMap[Phi->getIncomingBlock(i)]);
       }
     }
   }
-
-  void visitLoop(const std::vector<BasicBlock *> &SCC) {
-    visitSingleBlock(SCC[0]);
-  }
-
-  void markAsConditional(Instruction *Inst, Value *Condition) {
-    assert(!Inst->getMetadata(CONDITION_METADATA_ID) &&
-           "Instruction already conditional");
-    auto CondMD = ValueAsMetadata::get(Condition);
-    Inst->setMetadata(CONDITION_METADATA_ID, MDNode::get(Context, CondMD));
-  }
-
-  void PhiToSelect(PHINode *Phi) {
-    auto Result = Phi->getIncomingValue(0);
-    auto BB = Phi->getParent();
-    auto Cond = Conds.forEdge(Phi->getIncomingBlock(0), BB);
-    IRBuilder<> Builder(Phi);
-    for (unsigned i = 1; i < Phi->getNumIncomingValues(); ++i) {
-      Result = Builder.CreateSelect(Cond, Result, Phi->getIncomingValue(i),
-                                    Phi->getName());
-      Cond = Conds.forEdge(Phi->getIncomingBlock(i), BB);
-    }
-    Phi->replaceAllUsesWith(Result);
-    Phi->eraseFromParent();
-  }
-
-  void finish() {
-    assert(SoleReturn);
-    assert(LastBB);
-    LastBB->getInstList().push_back(SoleReturn);
-  }
 };
+
+bool isReducible(const std::vector<BasicBlock *> &SCC, Loop *L) {
+  if (!L) {
+    // If there's no Loop object for some BB in the SCC, it's part of a weird
+    // loop that is not reducible.
+    return false;
+  }
+  return std::all_of(SCC.begin(), SCC.end(),
+                     [=](BasicBlock *BB) { return L->contains(BB); });
+}
+
+struct ToposortState {
+  LoopInfo &LI;
+  std::vector<BasicBlock *> Output;
+  SmallPtrSet<BasicBlock *, 16> Seen;
+  BBMap<std::vector<BasicBlock *>> SubLoopOrders;
+
+  ToposortState(LoopInfo &LI) : LI(LI) {}
+};
+
+// Toposort the blocks that *directly* belong to the loop, and insert
+// sub-loop toposorts after their respective pre-headers.
+void loopToposortRec(BasicBlock *BB, Loop *L, ToposortState &State) {
+  DEBUG(dbgs() << "loopToposortRec: " << BB->getName());
+  State.Seen.insert(BB);
+
+  // We are only interested in blocks *immediately* contained in the
+  // current loop, so we don't record blocks from inner loops. But we still need
+  // to traverse the inner loops, because some blocks of the outer loop may not
+  // be reachable otherwise.
+  if (State.LI.getLoopDepth(BB) == L->getLoopDepth()) {
+    State.Output.push_back(BB);
+    // If this is a pre-header, now is the time to insert the sub-loop's
+    // blocks into the topological order.
+    if (State.SubLoopOrders.count(BB)) {
+      const auto &SubLoopOrder = State.SubLoopOrders[BB];
+      State.Output.insert(State.Output.end(), SubLoopOrder.begin(),
+                          SubLoopOrder.end());
+    }
+  }
+
+  for (auto Succ : successors(BB)) {
+    if (!State.Seen.count(Succ) && L->contains(Succ)) {
+      // We may have to process BBs from inner loops (see above), but we never
+      // need to consider blocks that are outside the loop, and we better not
+      // consider any blocks inside the loop twice.
+      loopToposortRec(Succ, L, State);
+    }
+  }
+}
+
+std::vector<BasicBlock *> loopToposort(Loop *L, LoopInfo &LI) {
+  DEBUG(dbgs() << "loopToposort: processing " << *L);
+  // We need to keep each nested loops "together", so we can't simply to a
+  // toposort of the whole SCC that _ignores_ back edges. Instead, we
+  // recursively determine a linear order of each sub-loop, and insert these
+  // linearizations at the right places: right after the sub-loops' pre-headers.
+  ToposortState State(LI);
+  for (Loop *SubLoop : *L) {
+    auto Preheader = SubLoop->getLoopPreheader();
+    assert(Preheader && "loop must be in canonical form (missing pre-header)");
+    State.SubLoopOrders[Preheader] = loopToposort(SubLoop, LI);
+  }
+  loopToposortRec(L->getHeader(), L, State);
+  DEBUG(dbgs() << "loopToposort: finished " << *L);
+  return std::move(State.Output);
+}
+
+Optional<std::vector<BasicBlock *>> findLinearOrder(Function *F, LoopInfo &LI) {
+  std::vector<std::vector<BasicBlock *>> SCCsLinearized;
+  for (auto I = scc_begin(F); !I.isAtEnd(); ++I) {
+    const std::vector<BasicBlock *> &SCC = *I;
+    if (I.hasLoop()) {
+      Loop *L = LI.getLoopFor(SCC[0]);
+      while (L && L->getParentLoop()) {
+        L = L->getParentLoop();
+      }
+      if (!isReducible(SCC, L)) {
+        return None;
+      }
+      // TODO check whether the loop is canonical
+      SCCsLinearized.push_back(loopToposort(L, LI));
+    } else {
+      SCCsLinearized.push_back({SCC[0]});
+    }
+  }
+
+  std::reverse(SCCsLinearized.begin(), SCCsLinearized.end());
+  std::vector<BasicBlock *> LinearOrder;
+  for (const auto &LinearOrderForSCC : SCCsLinearized) {
+    LinearOrder.insert(LinearOrder.end(), LinearOrderForSCC.begin(),
+                       LinearOrderForSCC.end());
+  }
+  return LinearOrder;
+}
 
 // Whether the use is across loop boundaries (including loop *iterations*).
 bool isCrossLoopUse(Loop *L, Use &U) {
@@ -594,7 +763,6 @@ struct FunctionVectorizer {
     if (!LI.empty()) {
       DEBUG(LI.print(dbgs()));
       for (Loop *L : LI) {
-        DEBUG(L->dumpVerbose());
         DEBUG(dbgs() << "Loop live values for " << L->getName() << ":\n");
         for (auto LLV : loopLiveValues(L)) {
           DEBUG(LLV->dump());
@@ -645,175 +813,121 @@ struct FunctionVectorizer {
     return NewF;
   }
 
-  void createBlockConditions(Conditions &Conds) {
-    BBMap<Value *> PlaceholderConds = Conds.ForBlock;
-
-    for (BasicBlock &BB : *LinearFunc) {
-      IRBuilder<> Builder(&BB, BB.getFirstInsertionPt());
-      Value *BlockCond = nullptr;
-      if (LI.isLoopHeader(&BB)) {
-        // The phi we're inserting will *not* be converted into a select later
-        // on, so we make sure it's *before* those other phi nodes.
-        Builder.SetInsertPoint(&BB, BB.begin());
-        auto Phi = Builder.CreatePHI(Builder.getInt1Ty(),
-                                     2 /* TODO this is a guess */);
-        for (auto Pred : predecessors(&BB)) {
-          Phi->addIncoming(Conds.forEdge(Pred, &BB), Pred);
-        }
-        Phi->setName(BB.getName() + ".exec");
-        BlockCond = Phi;
-      } else {
-        for (auto Pred : predecessors(&BB)) {
-          auto IncomingCond = Conds.forEdge(Pred, &BB);
-          if (!BlockCond) {
-            BlockCond = IncomingCond;
-          } else {
-            BlockCond = Builder.CreateOr(BlockCond, IncomingCond,
-                                         BB.getName() + ".exec");
-          }
-        }
-      }
-      if (!BlockCond) {
-        assert(&BB == &LinearFunc->getEntryBlock() && "unreachable block");
-        // The condition for the entry block is passed in as the first
-        // argument,
-        BlockCond = &*LinearFunc->arg_begin();
-      }
-      assert(BlockCond->getType() == Builder.getInt1Ty());
-      Conds.forBlock(&BB) = BlockCond;
-    }
-
-    // Some of the edge conditions are block condition placeholders,
-    // so we need to keep track of the replacements to apply them later.
-    // We could use a ValueHandle, but (1) I'm too stupid to get that to work,
-    // and (2) it complicates type signatures everywhere for something that
-    // can be solved locally here.
-    DenseMap<Value *, Value *> Replace;
-    for (auto &BB : *LinearFunc) {
-      Value *Cond = Conds.forBlock(&BB);
-      Value *Placeholder = PlaceholderConds[&BB];
-      Placeholder->replaceAllUsesWith(Cond);
-      Replace[Placeholder] = Cond;
-    }
-    for (auto &BB : *LinearFunc) {
-      auto NewV = Replace.find(Conds.forBlock(&BB));
-      if (NewV != Replace.end()) {
-        Conds.forBlock(&BB) = NewV->getSecond();
-      }
-
-      for (auto KVPair : Conds.ForEdge[&BB]) {
-        Value *V = KVPair.getSecond();
-        auto NewV = Replace.find(V);
-        if (NewV != Replace.end()) {
-          Conds.ForEdge[&BB][KVPair.getFirst()] = NewV->getSecond();
-        }
-      }
-    }
-    for (auto KVPair : PlaceholderConds) {
-      cast<Instruction>(KVPair.getSecond())->eraseFromParent();
-    }
-  }
-
-  void createEdgeConditions(BasicBlock &BB, Conditions &Conds) {
-    auto *BlockCond = Conds.forBlock(&BB);
-    auto *T = BB.getTerminator();
-    if (isa<UnreachableInst>(T) || isa<ReturnInst>(T)) {
-      // No successors => nothing to do.
-      return;
-    }
-    auto *Br = dyn_cast<BranchInst>(T);
-    if (!Br) {
-      std::string msg;
-      raw_string_ostream Msg(msg);
-      Msg << "LowerSPMD: cannot handle terminator: ";
-      T->print(Msg);
-      report_fatal_error(Msg.str());
-    }
-    auto FoundEdgeCond = [&](BasicBlock *Succ, Value *Cond) {
-      DEBUG(dbgs() << "Jump " << BB.getName() << " -> " << Succ->getName()
-                   << " with condition:\n");
-      DEBUG(Cond->print(dbgs()));
-      DEBUG(dbgs() << "\n");
-      Conds.addEdge(&BB, Succ, Cond);
-    };
-
-    if (Br->isConditional()) {
-      IRBuilder<> Builder(Br);
-      auto S0 = Br->getSuccessor(0), S1 = Br->getSuccessor(1);
-      auto *Cond0 = Br->getCondition();
-      auto *Cond1 = Builder.CreateNot(Cond0, "not." + Cond0->getName());
-      Cond0 = Builder.CreateAnd(BlockCond, Cond0,
-                                BB.getName() + ".to." + S0->getName());
-      Cond1 = Builder.CreateAnd(BlockCond, Cond1,
-                                BB.getName() + ".to." + S1->getName());
-      FoundEdgeCond(S0, Cond0);
-      FoundEdgeCond(S1, Cond1);
+  void linearizeCFG(ConditionTable &CT) {
+    std::vector<BasicBlock *> LinearOrder;
+    if (auto LinearOrderOpt = findLinearOrder(LinearFunc, LI)) {
+      LinearOrder = std::move(LinearOrderOpt.getValue());
     } else {
-      // Single successor => just re-use the block condition.
-      auto Succ = Br->getSuccessor(0);
-      FoundEdgeCond(Succ, BlockCond);
+      report_fatal_error("TODO don't even go here");
     }
-  }
 
-  void createBlockConditionPlaceholders(Conditions &Conds) {
-    Value *False = ConstantInt::getFalse(Context);
-    for (BasicBlock &BB : *LinearFunc) {
-      Instruction *ip = &*BB.getFirstInsertionPt();
-      Instruction *Placeholder =
-          BinaryOperator::Create(BinaryOperator::Or, False, False,
-                                 "exec.placeholder." + BB.getName(), ip);
-      Conds.forBlock(&BB) = Placeholder;
-    }
-  }
+    for (size_t i = 0; i < LinearOrder.size(); ++i) {
+      BasicBlock *BB = LinearOrder[i];
 
-  void linearizeCFG(Conditions &Conds) {
-    std::vector<std::vector<BasicBlock *>> SCCBBs;
-    for (auto I = scc_begin(LinearFunc); !I.isAtEnd(); ++I) {
-      DEBUG(dbgs() << "SCC: ");
-      for (auto BB : *I) {
-        DEBUG(dbgs() << BB->getName() << "@" << BB << " ");
+      Value *BlockCond = CT.blockCondition(BB);
+      for (Instruction &I : *BB) {
+        if (!isSafeToSpeculativelyExecute(&I)) {
+          markAsConditional(&I, BlockCond);
+        }
       }
-      DEBUG(dbgs() << "\n");
-      SCCBBs.push_back(*I);
+
+      if (!LI.isLoopHeader(BB)) {
+        PhisToSelect(BB, CT);
+      }
+
+      if (auto Ret = dyn_cast<ReturnInst>(BB->getTerminator())) {
+        // Because of blocks ending with unreachable, the return instruction
+        // may not come last in the topological ordering. So we forcibly put the
+        // return into the last block.
+        TerminatorInst *LastTerminator = LinearOrder.back()->getTerminator();
+        if (Ret != LastTerminator) {
+          assert(isa<UnreachableInst>(LastTerminator));
+          ReplaceInstWithInst(LastTerminator, Ret);
+          LastTerminator->eraseFromParent();
+        }
+      }
+
+      if (i + 1 < LinearOrder.size()) {
+        BasicBlock *NextBB = LinearOrder[i + 1];
+        linearizeTerminator(BB, NextBB, CT);
+      }
     }
-    // XXX scc_iterator on the Inverse graph doesn't seem to work?!
-    std::reverse(SCCBBs.begin(), SCCBBs.end());
+  }
 
-    Linearizer Lin(Conds, LinearFunc);
-
-    for (auto const &SCC : SCCBBs) {
-      Lin.visitSCC(SCC);
+  // Turns phis into selects and records the masks for instructions
+  // that need to be made conditional.
+  void PhisToSelect(BasicBlock *BB, ConditionTable &CT) {
+    // Need manual iterator fiddling because we remove the *current*
+    // instruction, so we can't advance the iterator at the *end* of the loop
+    // iteration as usual
+    for (auto Iter = BB->begin(); Iter != BB->end();) {
+      Instruction *I = &*Iter;
+      ++Iter;
+      if (auto *Phi = dyn_cast<PHINode>(I)) {
+        PhiToSelect(Phi, CT);
+      }
     }
+  }
 
-    Lin.finish();
+  void linearizeTerminator(BasicBlock *CurrentBB, BasicBlock *NextBB,
+                           ConditionTable &CT) {
+    Loop *L = LI.getLoopFor(CurrentBB);
+    if (L && L->getLoopLatch() == CurrentBB) {
+      BasicBlock *Header = L->getHeader();
+      assert(!L->contains(NextBB));
+      assert(Header);
+      auto Br = cast<BranchInst>(CurrentBB->getTerminator());
+      assert(Br->isConditional());
+      assert(Br->getSuccessor(0) == Header || Br->getSuccessor(1) == Header);
+      assert(!L->contains(Br->getSuccessor(0)) ||
+             !L->contains(Br->getSuccessor(1)));
+      // Canonicalize the branch so that the backedge happens on `true` and on
+      // `false` we carry on with the linearization.
+      Br->setSuccessor(0, Header);
+      Br->setSuccessor(1, NextBB);
+      Br->setCondition(CT.jumpCondition(CurrentBB, Header));
+    } else {
+      ReplaceInstWithInst(CurrentBB->getTerminator(),
+                          BranchInst::Create(NextBB));
+    }
+  }
+
+  void markAsConditional(Instruction *Inst, Value *Condition) {
+    assert(!Inst->getMetadata(CONDITION_METADATA_ID) &&
+           "Instruction already conditional");
+    auto CondMD = ValueAsMetadata::get(Condition);
+    Inst->setMetadata(CONDITION_METADATA_ID, MDNode::get(Context, CondMD));
+  }
+
+  void PhiToSelect(PHINode *Phi, ConditionTable &CT) {
+    auto Result = Phi->getIncomingValue(0);
+    auto BB = Phi->getParent();
+    auto Cond = CT.jumpCondition(Phi->getIncomingBlock(0), BB);
+    IRBuilder<> Builder(Phi);
+    for (unsigned i = 1; i < Phi->getNumIncomingValues(); ++i) {
+      Result = Builder.CreateSelect(Cond, Result, Phi->getIncomingValue(i),
+                                    Phi->getName());
+      Cond = CT.jumpCondition(Phi->getIncomingBlock(i), BB);
+    }
+    Phi->replaceAllUsesWith(Result);
+    Phi->eraseFromParent();
   }
 
   Function *run() {
-    Conditions Conds(*LinearFunc);
-    createBlockConditionPlaceholders(Conds);
-
-    // First, we materialize the (scalar) condition for *every* outgoing edge.
-    // Some of these values are constant (unconditional branches) or redundant
-    // (the negated condition for the `false` branch of a conditional branch),
-    // but they will be needed later to construct the masks for vectorization.
-    for (auto &BB : *LinearFunc) {
-      createEdgeConditions(BB, Conds);
-    }
-    createBlockConditions(Conds);
+    ConditionTable CT = createConditions(*LinearFunc, LI);
 
     DEBUG(dbgs() << "===================================================\n");
-    DEBUG(Conds.print(dbgs()));
+    DEBUG(CT.print(dbgs()));
     DEBUG(dbgs() << "\n");
 
-    // TODO compute loop masks, loop live values, and more generally:
-    // TODO support loops at all
-
     DEBUG(dbgs() << "===================================================\n");
     DEBUG(LinearFunc->print(dbgs()));
 
     DEBUG(dbgs() << "===================================================\n");
-    linearizeCFG(Conds);
+    linearizeCFG(CT);
     DEBUG(LinearFunc->print(dbgs()));
+
+    // TODO handle cross loop uses
 
     DEBUG(dbgs() << "===================================================\n");
     InstVectorizeVisitor IVV(*VectorFunc, LI, VectorizedFunctions);
