@@ -14,6 +14,7 @@
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Transforms/Utils/LoopUtils.h"
+#include <deque>
 using namespace llvm;
 
 #define DEBUG_TYPE "lowerspmd"
@@ -254,6 +255,10 @@ void combinedLoopExitCondition(Loop *L, ConditionTable &CT) {
     Combined->setName(L->getHeader()->getName() + ".combined.exit");
   }
   CT.addCombinedLoopExit(L, Combined);
+
+  for (Loop *SubLoop : *L) {
+    combinedLoopExitCondition(SubLoop, CT);
+  }
 }
 
 ConditionTable createConditions(Function &F, LoopInfo &LI) {
@@ -303,7 +308,7 @@ struct InstVectorizeVisitor : InstVisitor<InstVectorizeVisitor> {
   // Map each vectorized BB to the (last) vectorized BB resulting from the
   // original scalar block. Said "last block" contains the vectorized equivalent
   // of the scalar terminator, needed for vectorizing phis.
-  // TODO better names, possibly even an abstraction for these maps
+  // TODO this SUCKS and DOESN'T EVEN WORK
   BBMap<BasicBlock *> SplitBlockEnd;
 
   BasicBlock *CurrentBB = nullptr;
@@ -317,24 +322,20 @@ struct InstVectorizeVisitor : InstVisitor<InstVectorizeVisitor> {
   };
 
   InstVectorizeVisitor(
-      Function &VectorFunc, const LoopInfo &LI,
+      Function &VectorFunc, Function &ScalarFunc, const LoopInfo &LI,
       const DenseMap<Function *, Function *> &VectorizedFunctions)
       : VectorFunc(VectorFunc), Context(VectorFunc.getContext()), LI(LI),
         VectorizedFunctions(VectorizedFunctions) {
     for (auto &Arg : VectorFunc.args()) {
       Arguments.push_back(&Arg);
     }
+    for (auto &BB : ScalarFunc) {
+      auto VecBB = BasicBlock::Create(Context, BB.getName(), &VectorFunc);
+      BlockMap[&BB] = VecBB;
+    }
   }
 
   IRBuilder<> getBuilder() { return IRBuilder<>(CurrentBB); }
-
-  void visitFunction(Function &F) {
-    for (auto &BB : F) {
-      auto VecBB = BasicBlock::Create(Context, BB.getName(), &VectorFunc);
-      BlockMap[&BB] = VecBB;
-      SplitBlockEnd[VecBB] = VecBB;
-    }
-  }
 
   void visitBasicBlock(BasicBlock &BB) { CurrentBB = BlockMap[&BB]; }
 
@@ -446,7 +447,9 @@ struct InstVectorizeVisitor : InstVisitor<InstVectorizeVisitor> {
     auto CondBB = BasicBlock::Create(Context, CondBlockName, &VectorFunc);
     auto NextBB = BasicBlock::Create(Context, CurrentBB->getName() + ".cont",
                                      &VectorFunc);
-    SplitBlockEnd[OldBB] = NextBB;
+    SplitBlockEnd[OldBB] = NextBB; // BUG: this creates a chain through the
+                                   // split blocks, not a direct link from the
+                                   // start to the last one
 
     getBuilder().CreateCondBr(Cond, CondBB, NextBB);
     IRBuilder<> CondBuilder(CondBB);
@@ -674,9 +677,7 @@ struct InstVectorizeVisitor : InstVisitor<InstVectorizeVisitor> {
 
   Value *getVectorized(Value *Scalar) {
     if (auto I = dyn_cast<Instruction>(Scalar)) {
-      // assert(Scalar2Vector.count(I));
-      if (!Scalar2Vector.count(I))
-        return UndefValue::get(getVectorType(Scalar->getType())); // XXX
+      assert(Scalar2Vector.count(I));
       return Scalar2Vector[I];
     } else if (auto Arg = dyn_cast<Argument>(Scalar)) {
       return Arguments[Arg->getArgNo()];
@@ -712,7 +713,12 @@ struct InstVectorizeVisitor : InstVisitor<InstVectorizeVisitor> {
       for (unsigned i = 0; i < Phi->getNumIncomingValues(); ++i) {
         auto VecIncoming = getVectorized(Phi->getIncomingValue(i));
         auto IncomingBB = BlockMap[Phi->getIncomingBlock(i)];
-        VecPhi->addIncoming(VecIncoming, SplitBlockEnd[IncomingBB]);
+        // TODO get rid of this hack via a better data structure
+        // (or maybe a scheme that avoids the data structure entirely)
+        while (auto ContinuedBlock = SplitBlockEnd[IncomingBB]) {
+          IncomingBB = ContinuedBlock;
+        }
+        VecPhi->addIncoming(VecIncoming, IncomingBB);
       }
     }
   }
@@ -730,9 +736,9 @@ bool isReducible(const std::vector<BasicBlock *> &SCC, Loop *L) {
 
 struct ToposortState {
   LoopInfo &LI;
-  std::vector<BasicBlock *> Output;
+  std::deque<BasicBlock *> Output;
+  BBMap<std::deque<BasicBlock *>> SubLoopOrders;
   SmallPtrSet<BasicBlock *, 16> Seen;
-  BBMap<std::vector<BasicBlock *>> SubLoopOrders;
 
   ToposortState(LoopInfo &LI) : LI(LI) {}
 };
@@ -747,28 +753,27 @@ void loopToposortRec(BasicBlock *BB, Loop *L, ToposortState &State) {
   // current loop, so we don't record blocks from inner loops. But we still need
   // to traverse the inner loops, because some blocks of the outer loop may not
   // be reachable otherwise.
+  for (auto Succ : successors(BB)) {
+    // We never need to consider blocks that are outside the loop, though,
+    // and we better not consider any blocks twice.
+    if (!State.Seen.count(Succ) && L->contains(Succ)) {
+      loopToposortRec(Succ, L, State);
+    }
+  }
+
   if (State.LI.getLoopDepth(BB) == L->getLoopDepth()) {
-    State.Output.push_back(BB);
     // If this is a pre-header, now is the time to insert the sub-loop's
     // blocks into the topological order.
     if (State.SubLoopOrders.count(BB)) {
       const auto &SubLoopOrder = State.SubLoopOrders[BB];
-      State.Output.insert(State.Output.end(), SubLoopOrder.begin(),
+      State.Output.insert(State.Output.begin(), SubLoopOrder.begin(),
                           SubLoopOrder.end());
     }
-  }
-
-  for (auto Succ : successors(BB)) {
-    if (!State.Seen.count(Succ) && L->contains(Succ)) {
-      // We may have to process BBs from inner loops (see above), but we never
-      // need to consider blocks that are outside the loop, and we better not
-      // consider any blocks inside the loop twice.
-      loopToposortRec(Succ, L, State);
-    }
+    State.Output.push_front(BB);
   }
 }
 
-std::vector<BasicBlock *> loopToposort(Loop *L, LoopInfo &LI) {
+std::deque<BasicBlock *> loopToposort(Loop *L, LoopInfo &LI) {
   DEBUG(dbgs() << "loopToposort: processing " << *L);
   // We need to keep each nested loops "together", so we can't simply to a
   // toposort of the whole SCC that _ignores_ back edges. Instead, we
@@ -786,7 +791,7 @@ std::vector<BasicBlock *> loopToposort(Loop *L, LoopInfo &LI) {
 }
 
 Optional<std::vector<BasicBlock *>> findLinearOrder(Function *F, LoopInfo &LI) {
-  std::vector<std::vector<BasicBlock *>> SCCsLinearized;
+  std::vector<std::deque<BasicBlock *>> SCCsLinearized;
   for (auto I = scc_begin(F); !I.isAtEnd(); ++I) {
     const std::vector<BasicBlock *> &SCC = *I;
     if (I.hasLoop()) {
@@ -912,7 +917,7 @@ struct FunctionVectorizer {
     return NewF;
   }
 
-  void linearizeCFG(ConditionTable &CT) {
+  std::vector<BasicBlock *> linearizeCFG(ConditionTable &CT) {
     std::vector<BasicBlock *> LinearOrder;
     if (auto LinearOrderOpt = findLinearOrder(LinearFunc, LI)) {
       LinearOrder = std::move(LinearOrderOpt.getValue());
@@ -920,8 +925,15 @@ struct FunctionVectorizer {
       report_fatal_error("TODO don't even go here");
     }
 
+    DEBUG(dbgs() << "Linear order: ");
+    for (BasicBlock *BB : LinearOrder) {
+      DEBUG(dbgs() << BB->getName() << " ");
+    }
+    DEBUG(dbgs() << "\n");
+
     for (size_t i = 0; i < LinearOrder.size(); ++i) {
       BasicBlock *BB = LinearOrder[i];
+      DEBUG(dbgs() << "Linearizing " << BB->getName() << "\n");
 
       Value *BlockCond = CT.blockCondition(BB);
       for (Instruction &I : *BB) {
@@ -951,6 +963,7 @@ struct FunctionVectorizer {
         linearizeTerminator(BB, NextBB, CT);
       }
     }
+    return LinearOrder;
   }
 
   // Turns phis into selects and records the masks for instructions
@@ -972,6 +985,8 @@ struct FunctionVectorizer {
                            ConditionTable &CT) {
     Loop *L = LI.getLoopFor(CurrentBB);
     if (L && L->getLoopLatch() == CurrentBB) {
+      DEBUG(dbgs() << "linearizeTerminator: " << CurrentBB->getName() << " -> "
+                   << NextBB->getName() << " loop latch of " << *L);
       BasicBlock *Header = L->getHeader();
       assert(!L->contains(NextBB));
       assert(Header);
@@ -1031,6 +1046,7 @@ struct FunctionVectorizer {
     IRBuilder<> UpdateBuilder(DefLoop->getLoopLatch()->getTerminator());
     auto Update = UpdateBuilder.CreateSelect(CombExitCond, &I, Phis[DefLoop]);
     Update->setName("loopres." + I.getName());
+    DEBUG(dbgs() << "Created loop result update: " << *Update << "\n");
 
     // Now fill in the phis.
     for (Loop *L = DefLoop; L; L = L->getParentLoop()) {
@@ -1039,28 +1055,34 @@ struct FunctionVectorizer {
                                     : UndefValue::get(I.getType());
       Phis[L]->addIncoming(ParentValue, L->getLoopPreheader());
       Phis[L]->addIncoming(Update, L->getLoopLatch());
+      DEBUG(dbgs() << "Created loop result phi: " << *Phis[L] << "\n");
     }
     // Finally, all uses outside the loop should refer to the update:
     return Update;
   }
 
   Value *rewriteUsesToLoopResult(Instruction &I, const ConditionTable &CT) {
-    DEBUG(dbgs() << "rewriteUsesToLoopResult: " << I << "\n");
     Loop *L = LI.getLoopFor(I.getParent());
     Value *LoopResult = nullptr;
+    SmallVector<Use *, 4> UsesOutsideLoop;
     for (Use &U : I.uses()) {
       auto UserInst = dyn_cast<Instruction>(U.getUser());
       if (!UserInst || L->contains(UserInst)) {
         continue;
       }
-      DEBUG(dbgs() << "\tGonna replace use: " << *UserInst << "\n");
       // Create loop result vectors for all loop levels in one shot, even if we
       // may not need  all of them. This could be a bit wasteful, but it avoids
       // a bunch of complexity and loops usually aren't very deeply nested.
       if (!LoopResult) {
         LoopResult = createLoopResultFor(I, CT);
       }
-      U.set(LoopResult);
+      DEBUG(dbgs() << "Use of " << I.getName() << " outside loop: " << *UserInst
+                   << "\n");
+      UsesOutsideLoop.push_back(&U);
+    }
+    for (Use *U : UsesOutsideLoop) {
+      assert(LoopResult);
+      U->set(LoopResult);
     }
     return LoopResult;
   }
@@ -1107,14 +1129,16 @@ struct FunctionVectorizer {
     DEBUG(LinearFunc->print(dbgs()));
 
     DEBUG(dbgs() << "===================================================\n");
-    linearizeCFG(CT);
+    auto LinearOrder = linearizeCFG(CT);
     DEBUG(LinearFunc->print(dbgs()));
 
-    // TODO handle cross loop uses
-
     DEBUG(dbgs() << "===================================================\n");
-    InstVectorizeVisitor IVV(*VectorFunc, LI, VectorizedFunctions);
-    IVV.visit(*LinearFunc);
+    InstVectorizeVisitor IVV(*VectorFunc, *LinearFunc, LI, VectorizedFunctions);
+    for (BasicBlock *BB : LinearOrder) {
+      IVV.visit(BB);
+    }
+    DEBUG(dbgs() << "===================================================\n");
+    DEBUG(VectorFunc->print(dbgs()));
 
     LinearFunc->eraseFromParent();
     return VectorFunc;
