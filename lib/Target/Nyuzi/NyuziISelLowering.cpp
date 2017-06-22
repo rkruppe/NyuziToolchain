@@ -105,6 +105,7 @@ NyuziTargetLowering::NyuziTargetLowering(const TargetMachine &TM,
     { ISD::SELECT_CC, MVT::v16i32 },
     { ISD::SELECT_CC, MVT::v16f32 },
     { ISD::SELECT, MVT::v16i1 },
+    { ISD::VSELECT, MVT::v16i1 },
     { ISD::FDIV, MVT::f32 },
     { ISD::FDIV, MVT::v16f32 },
     { ISD::FNEG, MVT::f32 },
@@ -249,6 +250,8 @@ SDValue NyuziTargetLowering::LowerOperation(SDValue Op,
     return LowerSELECT_CC(Op, DAG);
   case ISD::SELECT:
     return LowerSELECT(Op, DAG);
+  case ISD::VSELECT:
+    return LowerVSELECT(Op, DAG);
   case ISD::SETCC:
     return LowerSETCC(Op, DAG);
   case ISD::ConstantPool:
@@ -1133,6 +1136,17 @@ SDValue NyuziTargetLowering::LowerSELECT(SDValue Op,
 
   return DAG.getNode(NyuziISD::SEL_COND_RESULT, DL, Op.getValueType(), Pred,
                      Op.getOperand(1), Op.getOperand(2));
+}
+
+SDValue NyuziTargetLowering::LowerVSELECT(SDValue Op, SelectionDAG &DAG) const {
+  SDLoc DL(Op);
+  SDValue MaskInt = DAG.getNode(NyuziISD::MASK_TO_INT, DL, MVT::i32, Op.getOperand(0));
+  SDValue NegMaskInt = DAG.getNode(ISD::XOR, DL, MVT::i32, MaskInt, DAG.getConstant(0xffff, DL, MVT::i32));
+  SDValue NegMask = DAG.getNode(NyuziISD::MASK_FROM_INT, DL, MVT::v16i1, NegMaskInt);
+  // vselect(mask, true_val, false_val) = (op1 & mask) | (op2 & ~mask)
+  SDValue TrueVals = DAG.getNode(ISD::AND, DL, MVT::v16i1, Op.getOperand(0), Op.getOperand(1));
+  SDValue FalseVals = DAG.getNode(ISD::AND, DL, MVT::v16i1, NegMask, Op.getOperand(2));
+  return DAG.getNode(ISD::OR, DL, MVT::v16i1, TrueVals, FalseVals);
 }
 
 SDValue NyuziTargetLowering::LowerSETCC(SDValue Op, SelectionDAG &DAG) const {
