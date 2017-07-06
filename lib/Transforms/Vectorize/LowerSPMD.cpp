@@ -56,6 +56,12 @@ class ConditionTable {
   // iteration left the loop. This is only needed for loop results.
   BBMap<BBMap<VH>> SingleJumpConditions;
 
+  // The loop exit condition for a single exit with respect to a loop L.
+  // This condition is accumulated over all iterations of child loops of L, but
+  // unlike the jump condition for (From, To) it is not accumulated over
+  // iterations of L and parent loops of L.
+  BBMap<BBMap<DenseMap<Loop *, VH>>> LoopExitConditions;
+
   // For each loop, stores the combined loop exit condition, i.e. the scalar
   // equivalent of the combined loop exit mask which encodes which lanes left
   // the loop in the current iteration.
@@ -82,6 +88,13 @@ public:
     SingleJumpConditions[From][To] = Cond;
   }
 
+  void addLoopExit(Loop *L, const BasicBlock *From, const BasicBlock *To,
+                   Value *Cond) {
+    assert(LoopExitConditions.lookup(From).lookup(To).count(L) == 0 &&
+           "Added loop exit twice");
+    LoopExitConditions[From][To][L] = Cond;
+  }
+
   void addCombinedLoopExit(Loop *L, Value *Cond) {
     assert(CombinedLoopExitConditions.count(L) == 0 && "Added loop twice");
     CombinedLoopExitConditions[L] = Cond;
@@ -93,12 +106,26 @@ public:
   }
 
   Value *jumpCondition(const BasicBlock *From, const BasicBlock *To) const {
+    // TODO this copies the entire inner DenseMap =/
     assert(JumpConditions.lookup(From).count(To) && "Unknown jump");
     return JumpConditions.lookup(From).lookup(To);
   }
 
+  Value *lookupLoopExit(Loop *L, const BasicBlock *From,
+                        const BasicBlock *To) const {
+    // TODO this copies the entire inner DenseMap =/
+    const auto &TableForLoop = LoopExitConditions.lookup(From).lookup(To);
+    // This dance is needed because VH can't be default-constructed
+    if (TableForLoop.count(L) != 0) {
+      return TableForLoop.lookup(L);
+    } else {
+      return nullptr;
+    }
+  }
+
   Value *singleJumpCondition(const BasicBlock *From,
                              const BasicBlock *To) const {
+    // TODO this copies the entire inner DenseMap =/
     assert(SingleJumpConditions.lookup(From).count(To) && "Unknown jump");
     return SingleJumpConditions.lookup(From).lookup(To);
   }
@@ -114,6 +141,7 @@ public:
         os << V->getName() << '\n';
       } else {
         V->print(os);
+        os << "\n";
       }
     };
     for (BasicBlock &BB : F) {
@@ -169,7 +197,7 @@ Value *createLoopExitCondition(BasicBlock *From, BasicBlock *To, Value *Cond,
     assert(L && "loop exit not nested in a parent loop??");
     Loop *ParentLoop = L->getParentLoop();
     auto Phi = Phis[L];
-    auto BackedgeV = L == SourceLoop ? static_cast<Value *>(Update) : Phi;
+    auto BackedgeV = cast<Value>(Update);
     auto PreheaderV = ParentLoop == TargetLoop ? False : Phis[ParentLoop];
     Phi->addIncoming(BackedgeV, L->getLoopLatch());
     Phi->addIncoming(PreheaderV, L->getLoopPreheader());
@@ -242,13 +270,64 @@ Value *createBlockCondition(BasicBlock *BB, const ConditionTable &CT,
   return Cond;
 }
 
-void combinedLoopExitCondition(Loop *L, ConditionTable &CT) {
+Value *getOrCreateLoopExitCondition(Loop *LimitLoop, const BasicBlock *From,
+                                    const BasicBlock *To, ConditionTable &CT,
+                                    LoopInfo &LI) {
+  DEBUG(dbgs() << "Trying to create loop exit condition for jump "
+               << From->getName() << " -> " << To->getName() << " up to loop "
+               << *LimitLoop << "\n");
+  Value *SingleCond = CT.singleJumpCondition(From, To);
+  Loop *SourceLoop = LI.getLoopFor(From);
+  assert(LimitLoop->contains(SourceLoop));
+  if (SourceLoop == LimitLoop) {
+    DEBUG(dbgs() << "\tLoop exit condition is simply the jump condition\n");
+    return SingleCond;
+  }
+  if (auto Cond = CT.lookupLoopExit(LimitLoop, From, To)) {
+    DEBUG(dbgs() << "\tCondition was already created");
+    return Cond;
+  }
+  DenseMap<Loop *, PHINode *> Phis;
+  for (auto L = SourceLoop; L != LimitLoop; L = L->getParentLoop()) {
+    assert(L != nullptr);
+    DEBUG(dbgs() << "\tCreating phi in " << L->getHeader()->getName() << ":\n");
+    IRBuilder<> Builder(&*L->getHeader()->getFirstNonPHI());
+    Phis[L] =
+        Builder.CreatePHI(Builder.getInt1Ty(), 2,
+                          LimitLoop->getHeader()->getName() + ".loopexit.phi");
+    DEBUG(dbgs() << "\t" << *Phis[L] << "\n");
+  }
+  IRBuilder<> UpdateBuilder(SourceLoop->getLoopLatch()->getTerminator());
+  assert(LI.getLoopFor(From));
+  assert(SingleCond);
+  auto Update =
+      UpdateBuilder.CreateOr(SingleCond, Phis[SourceLoop],
+                             LimitLoop->getHeader()->getName() + ".loopexit");
+
+  DEBUG(dbgs() << "Created loop exit update: " << *Update << "\n");
+
+  Value *False = UpdateBuilder.getFalse();
+  for (auto L = LI.getLoopFor(From); L != LimitLoop; L = L->getParentLoop()) {
+    auto ParentLoop = L->getParentLoop();
+    auto BackedgeV = cast<Value>(Update);
+    auto PreheaderV = ParentLoop == LimitLoop ? False : Phis[ParentLoop];
+    Phis[L]->addIncoming(BackedgeV, L->getLoopLatch());
+    Phis[L]->addIncoming(PreheaderV, L->getLoopPreheader());
+    DEBUG(dbgs() << "Created loop exit phi in " << L->getHeader()->getName()
+                 << ": " << *Phis[L] << "\n");
+  }
+  CT.addLoopExit(LimitLoop, From, To, Update);
+  return Update;
+}
+
+void combinedLoopExitCondition(Loop *L, ConditionTable &CT, LoopInfo &LI) {
   IRBuilder<> Builder(L->getLoopLatch()->getTerminator());
-  Value *Combined = Builder.getFalse();
+  Value *Combined = nullptr;
   SmallVector<Loop::Edge, 4> Exits;
   L->getExitEdges(Exits);
   for (Loop::Edge E : Exits) {
-    Value *ExitCond = CT.singleJumpCondition(E.first, E.second);
+    Value *ExitCond =
+        getOrCreateLoopExitCondition(L, E.first, E.second, CT, LI);
     Combined = Combined ? Builder.CreateOr(Combined, ExitCond) : ExitCond;
   }
   if (Combined->getName().empty()) {
@@ -257,7 +336,7 @@ void combinedLoopExitCondition(Loop *L, ConditionTable &CT) {
   CT.addCombinedLoopExit(L, Combined);
 
   for (Loop *SubLoop : *L) {
-    combinedLoopExitCondition(SubLoop, CT);
+    combinedLoopExitCondition(SubLoop, CT, LI);
   }
 }
 
@@ -290,7 +369,7 @@ ConditionTable createConditions(Function &F, LoopInfo &LI) {
 
   // Finally, combine the loop exit conditions.
   for (Loop *L : LI) {
-    combinedLoopExitCondition(L, CT);
+    combinedLoopExitCondition(L, CT, LI);
   }
 
   return CT;
@@ -818,27 +897,13 @@ Optional<std::vector<BasicBlock *>> findLinearOrder(Function *F, LoopInfo &LI) {
   return LinearOrder;
 }
 
-// Whether the use is across loop boundaries (including loop *iterations*).
-bool isCrossLoopUse(Loop *L, Use &U) {
-  if (auto Phi = dyn_cast<PHINode>(U.getUser())) {
-    // Uses across loop *iterations* must happen in a phi in the loop *header*:
-    // (1) It must be a phi, because defs from earlier iterations don't dominate
-    // uses in later iterations.
-    // (2) The phi must be in the loop header, as phis *within* the loop can't
-    // distinguish between the loop back edge and other edges entering the loop.
-    return Phi->getParent() == L->getHeader();
-  }
-  // The only other way to have a use across loop boundaries is to
-  // use the def *outside* the loop, which we can query directly.
-  return !L->contains(cast<Instruction>(U.getUser()));
-}
-
 struct FunctionVectorizer {
   LLVMContext &Context;
+  LoopInfo LI;
   Function *LinearFunc;
   Function *VectorFunc;
   const DenseMap<Function *, Function *> &VectorizedFunctions;
-  LoopInfo LI;
+  SmallVector<Instruction *, 8> LoopLiveValues;
 
   FunctionVectorizer(
       Function &F, Function &VF,
@@ -864,29 +929,25 @@ struct FunctionVectorizer {
 
     DominatorTree DomTree(*LinearFunc);
     LI = LoopInfo(DomTree);
-    if (!LI.empty()) {
-      DEBUG(LI.print(dbgs()));
-      for (Loop *L : LI) {
-        DEBUG(dbgs() << "Loop live values for " << L->getName() << ":\n");
-        for (auto LLV : loopLiveValues(L)) {
-          DEBUG(LLV->dump());
-        }
-      }
-      DEBUG(dbgs() << '\n');
-    }
-  }
 
-  DenseSet<Instruction *> loopLiveValues(Loop *L) {
-    DenseSet<Instruction *> LiveValues;
-    for (auto BB : L->blocks()) {
-      for (auto &I : *BB) {
-        if (std::any_of(I.use_begin(), I.use_end(),
-                        [=](Use &U) { return isCrossLoopUse(L, U); })) {
-          LiveValues.insert(&I);
+    // We're only interested in values used *outside* the loop
+    // Uses in later iterations of the same loop (i.e., uses in phis in the loop
+    // header) don't need result vectors.
+    for (auto &BB : *LinearFunc) {
+      Loop *L = LI.getLoopFor(&BB);
+      if (!L) {
+        continue;
+      }
+      for (auto &I : BB) {
+        bool usedOutsideLoop =
+            std::any_of(I.user_begin(), I.user_end(), [=](User *U) {
+              return !L->contains(cast<Instruction>(U));
+            });
+        if (usedOutsideLoop) {
+          LoopLiveValues.push_back(&I);
         }
       }
     }
-    return LiveValues;
   }
 
   // Create an empty function with the same prototype as F, except that an
@@ -961,6 +1022,7 @@ struct FunctionVectorizer {
       if (i + 1 < LinearOrder.size()) {
         BasicBlock *NextBB = LinearOrder[i + 1];
         linearizeTerminator(BB, NextBB, CT);
+        NextBB->moveAfter(BB);
       }
     }
     return LinearOrder;
@@ -1021,18 +1083,18 @@ struct FunctionVectorizer {
   void PhiToSelect(PHINode *Phi, ConditionTable &CT) {
     auto Result = Phi->getIncomingValue(0);
     auto BB = Phi->getParent();
-    auto Cond = CT.jumpCondition(Phi->getIncomingBlock(0), BB);
     IRBuilder<> Builder(Phi);
     for (unsigned i = 1; i < Phi->getNumIncomingValues(); ++i) {
-      Result = Builder.CreateSelect(Cond, Result, Phi->getIncomingValue(i),
+      auto Cond = CT.jumpCondition(Phi->getIncomingBlock(i), BB);
+      Result = Builder.CreateSelect(Cond, Phi->getIncomingValue(i), Result,
                                     Phi->getName());
-      Cond = CT.jumpCondition(Phi->getIncomingBlock(i), BB);
     }
     Phi->replaceAllUsesWith(Result);
     Phi->eraseFromParent();
   }
 
-  Value *createLoopResultFor(Instruction &I, const ConditionTable &CT) {
+  Value *createLoopResultInstructions(Instruction &I,
+                                      const ConditionTable &CT) {
     Loop *DefLoop = LI.getLoopFor(I.getParent());
     DenseMap<Loop *, PHINode *> Phis;
     // First, insert phis in all loop levels, but don't fill them yet.
@@ -1061,57 +1123,23 @@ struct FunctionVectorizer {
     return Update;
   }
 
-  Value *rewriteUsesToLoopResult(Instruction &I, const ConditionTable &CT) {
+  void insertLoopResult(Instruction &I, const ConditionTable &CT) {
     Loop *L = LI.getLoopFor(I.getParent());
-    Value *LoopResult = nullptr;
-    SmallVector<Use *, 4> UsesOutsideLoop;
+    SmallVector<Use *, 8> UsesOutsideLoop;
     for (Use &U : I.uses()) {
       auto UserInst = dyn_cast<Instruction>(U.getUser());
       if (!UserInst || L->contains(UserInst)) {
         continue;
       }
-      // Create loop result vectors for all loop levels in one shot, even if we
-      // may not need  all of them. This could be a bit wasteful, but it avoids
-      // a bunch of complexity and loops usually aren't very deeply nested.
-      if (!LoopResult) {
-        LoopResult = createLoopResultFor(I, CT);
-      }
-      DEBUG(dbgs() << "Use of " << I.getName() << " outside loop: " << *UserInst
-                   << "\n");
+      DEBUG(dbgs() << "Will rewrite use of " << I.getName()
+                   << " outside loop: " << *UserInst << "\n");
       UsesOutsideLoop.push_back(&U);
     }
+    assert(UsesOutsideLoop.size() > 0 &&
+           "Inserted loop result for instruction that does not need one");
+    auto LoopResult = createLoopResultInstructions(I, CT);
     for (Use *U : UsesOutsideLoop) {
-      assert(LoopResult);
       U->set(LoopResult);
-    }
-    return LoopResult;
-  }
-
-  void insertLoopResultsRec(Loop *L, const ConditionTable &CT) {
-    for (Loop *SubLoop : *L) {
-      insertLoopResultsRec(SubLoop, CT);
-    }
-    // We're inserting instructions computing loop results as we go, so
-    // we need to remember which instructions we inserted to avoid infinite
-    // loops.
-    SmallPtrSet<Value *, 8> LoopResults;
-    // TODO does this visit instructions in nested loops multiple times?
-    for (BasicBlock *BB : L->blocks()) {
-      for (Instruction &I : *BB) {
-        if (!LoopResults.count(&I)) {
-          auto LoopResult = rewriteUsesToLoopResult(I, CT);
-          if (LoopResult) {
-            LoopResults.insert(LoopResult);
-          }
-        }
-      }
-    }
-  }
-
-  void insertLoopResults(const ConditionTable &CT) {
-    DEBUG(LinearFunc->dump());
-    for (Loop *L : LI) {
-      insertLoopResultsRec(L, CT);
     }
   }
 
@@ -1120,10 +1148,13 @@ struct FunctionVectorizer {
 
     DEBUG(dbgs() << "===================================================\n");
     DEBUG(CT.print(dbgs()));
+    DEBUG(LI.print(dbgs()));
     DEBUG(dbgs() << "\n");
 
     DEBUG(dbgs() << "===================================================\n");
-    insertLoopResults(CT);
+    for (Instruction *I : LoopLiveValues) {
+      insertLoopResult(*I, CT);
+    }
 
     DEBUG(dbgs() << "===================================================\n");
     DEBUG(LinearFunc->print(dbgs()));
@@ -1215,9 +1246,13 @@ Function *predefineVectorizedFunction(Function &ScalarFunc) {
                             : VectorType::get(ScalarReturnTy, SIMD_WIDTH);
   auto VectorFT = FunctionType::get(VectorReturnTy, VectorArgTys,
                                     /* isVarArg: */ false);
-  return Function::Create(VectorFT, ScalarFunc.getLinkage(),
-                          ScalarFunc.getName() + ".vector",
-                          ScalarFunc.getParent());
+  auto VectorFunc = Function::Create(VectorFT, ScalarFunc.getLinkage(),
+                                     ScalarFunc.getName() + ".vector",
+                                     ScalarFunc.getParent());
+  if (ScalarFunc.hasFnAttribute(Attribute::NoInline)) {
+    VectorFunc->addFnAttr(Attribute::NoInline);
+  }
+  return VectorFunc;
 }
 
 struct LowerSPMD : public ModulePass {
