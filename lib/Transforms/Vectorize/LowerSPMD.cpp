@@ -15,6 +15,7 @@
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Transforms/Utils/LoopUtils.h"
 #include <deque>
+#include <vector>
 using namespace llvm;
 
 #define DEBUG_TYPE "lowerspmd"
@@ -22,99 +23,95 @@ using namespace llvm;
 namespace {
 
 const unsigned SIMD_WIDTH = 16;
-const char *CONDITION_METADATA_ID = "spmd-conditional";
+const char *MASK_METADATA_ID = "spmd-mask";
 
 template <typename T> using BBMap = DenseMap<const BasicBlock *, T>;
 
-// This table holds the various scalar conditions needed to linearize a
-// function. Because it is built and used before vectorization, it stores i1
-// *conditions*, which are often redundant, and may be computed in an
-// unnecessarily convoluted way even when not redundant. This is so that
-// vectorization does not have to deal with control flow very much and can
-// simply vectorize every instruction 1:1.
-class ConditionTable {
+// This table holds the various masks needed to linearize a function. Because it
+// is built and used before vectorization, it stores scalar booleans, but we
+// will mostly treat them like ordinary masks for a vector width of 1.
+// Their semantics and how they are computed is specifically designed to do The
+// Right Thing after vectorization.
+class MaskTable {
   using VH = TrackingVH<Value>;
 
-  // For each BB, stores the block condition, i.e., the scalar equivalent of the
-  // mask that encodes which lanes are executing a block. For loop headers this
-  // is exactly the "loop condition" (i.e., scalar loop mask).
-  // In scalar terms, it is an i1 that is true iff the block is executed
-  // (although it is only actually computed in the block itself).
-  BBMap<VH> BlockConditions;
+  // For each BB, stores the block mask, which lanes are executing the block.
+  BBMap<VH> BlockMasks;
 
-  // For each pair of blocks (BB1, BB2) that have an edge between them, stores
-  // an i1 that is true iff there was a jump from BB1 to BB2. This may be a
-  // combination of the branch condition and the source block's condition, or a
-  // loop exit mask.
+  // For each pair of blocks (BB1 -> BB2) that have an edge between them, this
+  // mask tells us which lanes took that edge to arrive at BB2. For loop exits
+  // (where BB1 may be executed several times for every time BB2 is executed)
+  // this mask accumulates over the loop iterations.
   // FIXME the representation is fine, but the mask generation will fall apart
-  // if there are multiple edges between two blocks. Other code may also be
-  // rewritten to support this.
-  BBMap<BBMap<VH>> JumpConditions;
+  // if there are multiple edges between two blocks. Other code may also need to
+  // be rewritten to support this.
+  BBMap<BBMap<VH>> EdgeMasks;
 
-  // Like the jump condition, but not accumulated across iterations in case of
-  // loop exits. In other words, this condition indicates whether the *current*
+  // Like the edge mask, but not accumulated across iterations in case of loop
+  // exits. In other words, this mask indicates whether the *current*
   // iteration left the loop. This is only needed for loop results.
-  BBMap<BBMap<VH>> SingleJumpConditions;
+  // FIXME see EdgeMasks re: multiple edges between a pair of blocks
+  BBMap<BBMap<VH>> SingleJumpMasks;
 
-  // The loop exit condition for a single exit with respect to a loop L.
-  // This condition is accumulated over all iterations of child loops of L, but
-  // unlike the jump condition for (From, To) it is not accumulated over
+  // The loop exit mask for a single exit with respect to a loop L.
+  // This mask is accumulated over all iterations of child loops of L, but
+  // unlike the edge mask for (From, To) it is not accumulated over
   // iterations of L and parent loops of L.
-  BBMap<BBMap<DenseMap<Loop *, VH>>> LoopExitConditions;
+  BBMap<BBMap<DenseMap<Loop *, VH>>> LoopExitMasks;
 
-  // For each loop, stores the combined loop exit condition, i.e. the scalar
+  // For each loop, stores the combined loop exit mask, i.e. the scalar
   // equivalent of the combined loop exit mask which encodes which lanes left
   // the loop in the current iteration.
-  DenseMap<Loop *, VH> CombinedLoopExitConditions;
+  DenseMap<Loop *, VH> CombinedLoopExitMasks;
 
   Function &F;
 
 public:
-  ConditionTable(Function &F) : F(F) {}
+  MaskTable(Function &F) : F(F) {}
 
-  void addBlock(const BasicBlock *BB, Value *Cond) {
-    assert(BlockConditions.count(BB) == 0 && "Added block twice");
-    BlockConditions[BB] = Cond;
+  void addBlock(const BasicBlock *BB, Value *Mask) {
+    assert(BlockMasks.count(BB) == 0 && "Added block twice");
+    BlockMasks[BB] = Mask;
   }
 
-  void addJump(const BasicBlock *From, const BasicBlock *To, Value *Cond) {
-    assert(JumpConditions[From].count(To) == 0 && "Added edge twice");
-    JumpConditions[From][To] = Cond;
+  void addJump(const BasicBlock *From, const BasicBlock *To, Value *Mask) {
+    assert(EdgeMasks[From].count(To) == 0 && "Added edge twice");
+    EdgeMasks[From][To] = Mask;
   }
 
   void addSingleJump(const BasicBlock *From, const BasicBlock *To,
-                     Value *Cond) {
-    assert(SingleJumpConditions[From].count(To) == 0 && "Added edge twice");
-    SingleJumpConditions[From][To] = Cond;
+                     Value *Mask) {
+    assert(SingleJumpMasks[From].count(To) == 0 && "Added edge twice");
+    SingleJumpMasks[From][To] = Mask;
   }
 
   void addLoopExit(Loop *L, const BasicBlock *From, const BasicBlock *To,
-                   Value *Cond) {
-    assert(LoopExitConditions.lookup(From).lookup(To).count(L) == 0 &&
+                   Value *Mask) {
+    assert(LoopExitMasks.lookup(From).lookup(To).count(L) == 0 &&
            "Added loop exit twice");
-    LoopExitConditions[From][To][L] = Cond;
+    LoopExitMasks[From][To][L] = Mask;
   }
 
-  void addCombinedLoopExit(Loop *L, Value *Cond) {
-    assert(CombinedLoopExitConditions.count(L) == 0 && "Added loop twice");
-    CombinedLoopExitConditions[L] = Cond;
+  void addCombinedLoopExit(Loop *L, Value *Mask) {
+    assert(CombinedLoopExitMasks.count(L) == 0 && "Added loop twice");
+    CombinedLoopExitMasks[L] = Mask;
   }
 
-  Value *blockCondition(const BasicBlock *BB) const {
-    assert(BlockConditions.count(BB) && "Unknown block");
-    return BlockConditions.lookup(BB);
+  Value *blockMask(const BasicBlock *BB) const {
+    assert(BlockMasks.count(BB) && "Unknown block");
+    return BlockMasks.lookup(BB);
   }
 
-  Value *jumpCondition(const BasicBlock *From, const BasicBlock *To) const {
+  Value *edgeMask(const BasicBlock *From, const BasicBlock *To) const {
     // TODO this copies the entire inner DenseMap =/
-    assert(JumpConditions.lookup(From).count(To) && "Unknown jump");
-    return JumpConditions.lookup(From).lookup(To);
+    assert(EdgeMasks.lookup(From).count(To) && "Unknown jump");
+    return EdgeMasks.lookup(From).lookup(To);
   }
 
   Value *lookupLoopExit(Loop *L, const BasicBlock *From,
                         const BasicBlock *To) const {
     // TODO this copies the entire inner DenseMap =/
-    const auto &TableForLoop = LoopExitConditions.lookup(From).lookup(To);
+    const auto &TableForLoop = LoopExitMasks.lookup(From).lookup(To);
     // This dance is needed because VH can't be default-constructed
     if (TableForLoop.count(L) != 0) {
       return TableForLoop.lookup(L);
@@ -123,16 +120,15 @@ public:
     }
   }
 
-  Value *singleJumpCondition(const BasicBlock *From,
-                             const BasicBlock *To) const {
+  Value *singleJumpMask(const BasicBlock *From, const BasicBlock *To) const {
     // TODO this copies the entire inner DenseMap =/
-    assert(SingleJumpConditions.lookup(From).count(To) && "Unknown jump");
-    return SingleJumpConditions.lookup(From).lookup(To);
+    assert(SingleJumpMasks.lookup(From).count(To) && "Unknown jump");
+    return SingleJumpMasks.lookup(From).lookup(To);
   }
 
-  Value *combinedLoopExitCondition(Loop *L) const {
-    assert(CombinedLoopExitConditions.count(L) && "Unknown loop");
-    return CombinedLoopExitConditions.lookup(L);
+  Value *combinedLoopExitMask(Loop *L) const {
+    assert(CombinedLoopExitMasks.count(L) && "Unknown loop");
+    return CombinedLoopExitMasks.lookup(L);
   }
 
   void print(raw_ostream &os) {
@@ -145,20 +141,19 @@ public:
       }
     };
     for (BasicBlock &BB : F) {
-      os << "Block condition " << BB.getName() << ": ";
-      Dump(BlockConditions[&BB]);
+      os << "Block mask " << BB.getName() << ": ";
+      Dump(BlockMasks[&BB]);
     }
     for (auto &From : F) {
       for (auto &To : F) {
-        if (JumpConditions[&From].count(&To) == 0) {
+        if (EdgeMasks[&From].count(&To) == 0) {
           continue;
         }
-        os << "Jump condition " << From.getName() << " -> " << To.getName()
-           << ": ";
-        Dump(JumpConditions[&From][&To]);
+        os << "Edge mask " << From.getName() << " -> " << To.getName() << ": ";
+        Dump(EdgeMasks[&From][&To]);
       }
     }
-    // TODO print combined loop exit conditions
+    // TODO print {,combined} loop exit masks
   }
 };
 
@@ -166,12 +161,12 @@ bool isLoopExit(BasicBlock *From, BasicBlock *To, LoopInfo &LI) {
   return LI.getLoopDepth(From) > LI.getLoopDepth(To);
 }
 
-Value *createLoopExitCondition(BasicBlock *From, BasicBlock *To, Value *Cond,
-                               ConditionTable &CT, LoopInfo &LI) {
-  // Create (1) an "update operation" at the exit that ORs the condition for
-  // the actual jump with (2) a phi in the loop header that preserves the exit
-  // condition from the previous iteration.
-  // (1) becomes the real jump condition.
+Value *createLoopExitMask(BasicBlock *From, BasicBlock *To, Value *SingleMask,
+                          MaskTable &MT, LoopInfo &LI) {
+  // Create (1) an "update operation" at the exit that ORs the mask for
+  // the exit edge with (2) a phi in the loop header that preserves the exit
+  // mask from the previous iteration.
+  // (1) is the resulting jump mask.
   // If the jump breaks out of multiple loops at once, we need to accumulate the
   // exit mask over all outer loop iterations, so we create phis in parent
   // loops up until the loop level right below the target of the exit.
@@ -189,7 +184,7 @@ Value *createLoopExitCondition(BasicBlock *From, BasicBlock *To, Value *Cond,
   }
 
   IRBuilder<> UpdateBuilder(From->getTerminator());
-  auto Update = UpdateBuilder.CreateOr(Phis[SourceLoop], Cond);
+  auto Update = UpdateBuilder.CreateOr(Phis[SourceLoop], SingleMask);
 
   // Now fill in the phis
   Value *False = UpdateBuilder.getFalse();
@@ -205,23 +200,22 @@ Value *createLoopExitCondition(BasicBlock *From, BasicBlock *To, Value *Cond,
   return Update;
 }
 
-void createJumpCondition(BasicBlock *From, BasicBlock *To, Value *Cond,
-                         ConditionTable &CT, LoopInfo &LI) {
+void createEdgeMask(BasicBlock *From, BasicBlock *To, Value *SingleMask,
+                    MaskTable &MT, LoopInfo &LI) {
   DEBUG(dbgs() << "Jump " << From->getName() << " -> " << To->getName()
-               << " with condition: " << *Cond << "\n");
-  CT.addSingleJump(From, To, Cond);
-  if (Cond->getName().empty()) {
-    Cond->setName(From->getName() + ".to." + To->getName());
+               << " with mask: " << *SingleMask << "\n");
+  MT.addSingleJump(From, To, SingleMask);
+  if (SingleMask->getName().empty()) {
+    SingleMask->setName(From->getName() + ".to." + To->getName());
   }
   if (isLoopExit(From, To, LI)) {
-    Cond = createLoopExitCondition(From, To, Cond, CT, LI);
+    SingleMask = createLoopExitMask(From, To, SingleMask, MT, LI);
   }
-  CT.addJump(From, To, Cond);
+  MT.addJump(From, To, SingleMask);
 }
 
-void createJumpConditionsFrom(BasicBlock *BB, ConditionTable &CT,
-                              LoopInfo &LI) {
-  auto *BlockCond = CT.blockCondition(BB);
+void createEdgeMasksFrom(BasicBlock *BB, MaskTable &MT, LoopInfo &LI) {
+  auto *BlockCond = MT.blockMask(BB);
   auto *Terminator = BB->getTerminator();
   if (isa<UnreachableInst>(Terminator) || isa<ReturnInst>(Terminator)) {
     // No successors => nothing to do.
@@ -233,59 +227,58 @@ void createJumpConditionsFrom(BasicBlock *BB, ConditionTable &CT,
     IRBuilder<> Builder(Br);
     auto *Cond0 = Br->getCondition();
     auto *Cond1 = Builder.CreateNot(Cond0, "not." + Cond0->getName());
-    createJumpCondition(BB, Br->getSuccessor(0),
-                        Builder.CreateAnd(BlockCond, Cond0), CT, LI);
-    createJumpCondition(BB, Br->getSuccessor(1),
-                        Builder.CreateAnd(BlockCond, Cond1), CT, LI);
+    createEdgeMask(BB, Br->getSuccessor(0), Builder.CreateAnd(BlockCond, Cond0),
+                   MT, LI);
+    createEdgeMask(BB, Br->getSuccessor(1), Builder.CreateAnd(BlockCond, Cond1),
+                   MT, LI);
   } else {
-    // Single successor => just re-use the block condition.
-    createJumpCondition(BB, Br->getSuccessor(0), BlockCond, CT, LI);
+    // Single successor => just re-use the block mask.
+    createEdgeMask(BB, Br->getSuccessor(0), BlockCond, MT, LI);
   }
 }
 
-Value *createBlockCondition(BasicBlock *BB, const ConditionTable &CT,
-                            LoopInfo &LI) {
+Value *createBlockMask(BasicBlock *BB, const MaskTable &MT, LoopInfo &LI) {
   IRBuilder<> Builder(BB, BB->getFirstInsertionPt());
-  Value *Cond = nullptr;
+  Value *Mask = nullptr;
   if (LI.isLoopHeader(BB)) {
     auto Phi = Builder.CreatePHI(Builder.getInt1Ty(), 2);
     for (auto Pred : predecessors(BB)) {
-      Phi->addIncoming(CT.jumpCondition(Pred, BB), Pred);
+      Phi->addIncoming(MT.edgeMask(Pred, BB), Pred);
     }
-    Cond = Phi;
+    Mask = Phi;
   } else {
     for (auto Pred : predecessors(BB)) {
-      auto JumpCond = CT.jumpCondition(Pred, BB);
-      Cond = Cond ? Builder.CreateOr(Cond, JumpCond) : JumpCond;
+      auto JumpMask = MT.edgeMask(Pred, BB);
+      Mask = Mask ? Builder.CreateOr(Mask, JumpMask) : JumpMask;
     }
   }
-  if (!Cond) {
+  if (!Mask) {
     auto F = BB->getParent();
     assert(BB == &F->getEntryBlock() && "unreachable block");
-    // The entry block condition is pass in as first argument.
-    Cond = &*F->arg_begin();
+    // The entry block mask is pass in as first argument.
+    Mask = &*F->arg_begin();
   }
-  Cond->setName(BB->getName() + ".exec");
-  assert(Cond->getType() == Builder.getInt1Ty());
-  return Cond;
+  Mask->setName(BB->getName() + ".exec");
+  assert(Mask->getType() == Builder.getInt1Ty());
+  return Mask;
 }
 
-Value *getOrCreateLoopExitCondition(Loop *LimitLoop, const BasicBlock *From,
-                                    const BasicBlock *To, ConditionTable &CT,
-                                    LoopInfo &LI) {
-  DEBUG(dbgs() << "Trying to create loop exit condition for jump "
-               << From->getName() << " -> " << To->getName() << " up to loop "
-               << *LimitLoop << "\n");
-  Value *SingleCond = CT.singleJumpCondition(From, To);
+Value *getOrCreateLoopExitMask(Loop *LimitLoop, const BasicBlock *From,
+                               const BasicBlock *To, MaskTable &MT,
+                               LoopInfo &LI) {
+  DEBUG(dbgs() << "Trying to create loop exit mask for jump " << From->getName()
+               << " -> " << To->getName() << " up to loop " << *LimitLoop
+               << "\n");
+  Value *SingleMask = MT.singleJumpMask(From, To);
   Loop *SourceLoop = LI.getLoopFor(From);
   assert(LimitLoop->contains(SourceLoop));
   if (SourceLoop == LimitLoop) {
-    DEBUG(dbgs() << "\tLoop exit condition is simply the jump condition\n");
-    return SingleCond;
+    DEBUG(dbgs() << "\tLoop exit mask is the single jump mask\n");
+    return SingleMask;
   }
-  if (auto Cond = CT.lookupLoopExit(LimitLoop, From, To)) {
-    DEBUG(dbgs() << "\tCondition was already created");
-    return Cond;
+  if (auto Mask = MT.lookupLoopExit(LimitLoop, From, To)) {
+    DEBUG(dbgs() << "\tMask was already created");
+    return Mask;
   }
   DenseMap<Loop *, PHINode *> Phis;
   for (auto L = SourceLoop; L != LimitLoop; L = L->getParentLoop()) {
@@ -299,9 +292,9 @@ Value *getOrCreateLoopExitCondition(Loop *LimitLoop, const BasicBlock *From,
   }
   IRBuilder<> UpdateBuilder(SourceLoop->getLoopLatch()->getTerminator());
   assert(LI.getLoopFor(From));
-  assert(SingleCond);
+  assert(SingleMask);
   auto Update =
-      UpdateBuilder.CreateOr(SingleCond, Phis[SourceLoop],
+      UpdateBuilder.CreateOr(SingleMask, Phis[SourceLoop],
                              LimitLoop->getHeader()->getName() + ".loopexit");
 
   DEBUG(dbgs() << "Created loop exit update: " << *Update << "\n");
@@ -316,63 +309,62 @@ Value *getOrCreateLoopExitCondition(Loop *LimitLoop, const BasicBlock *From,
     DEBUG(dbgs() << "Created loop exit phi in " << L->getHeader()->getName()
                  << ": " << *Phis[L] << "\n");
   }
-  CT.addLoopExit(LimitLoop, From, To, Update);
+  MT.addLoopExit(LimitLoop, From, To, Update);
   return Update;
 }
 
-void combinedLoopExitCondition(Loop *L, ConditionTable &CT, LoopInfo &LI) {
+void combinedLoopExitMask(Loop *L, MaskTable &MT, LoopInfo &LI) {
   IRBuilder<> Builder(L->getLoopLatch()->getTerminator());
   Value *Combined = nullptr;
   SmallVector<Loop::Edge, 4> Exits;
   L->getExitEdges(Exits);
   for (Loop::Edge E : Exits) {
-    Value *ExitCond =
-        getOrCreateLoopExitCondition(L, E.first, E.second, CT, LI);
+    Value *ExitCond = getOrCreateLoopExitMask(L, E.first, E.second, MT, LI);
     Combined = Combined ? Builder.CreateOr(Combined, ExitCond) : ExitCond;
   }
   if (Combined->getName().empty()) {
     Combined->setName(L->getHeader()->getName() + ".combined.exit");
   }
-  CT.addCombinedLoopExit(L, Combined);
+  MT.addCombinedLoopExit(L, Combined);
 
   for (Loop *SubLoop : *L) {
-    combinedLoopExitCondition(SubLoop, CT, LI);
+    combinedLoopExitMask(SubLoop, MT, LI);
   }
 }
 
-ConditionTable createConditions(Function &F, LoopInfo &LI) {
-  ConditionTable CT(F);
+MaskTable createMasks(Function &F, LoopInfo &LI) {
+  MaskTable MT(F);
 
-  // There are cyclic dependencies between block and jump conditions, so we
-  // break the cycle by introducing placeholders for the block conditions which
-  // are later RAUW'd the real block conditions.
+  // There are cyclic dependencies between block and jump masks, so we
+  // break the cycle by introducing placeholders for the block masks which
+  // are later RAUW'd the real block masks.
   Value *False = ConstantInt::getFalse(F.getContext());
   for (auto &BB : F) {
     Instruction *ip = &*BB.getFirstInsertionPt();
     Instruction *Placeholder =
         BinaryOperator::Create(BinaryOperator::Or, False, False,
                                "exec.placeholder." + BB.getName(), ip);
-    CT.addBlock(&BB, Placeholder);
+    MT.addBlock(&BB, Placeholder);
   }
 
-  // Now we create the jump conditions, including loop exit conditions
+  // Now we create the jump masks, including loop exit masks.
   for (auto &BB : F) {
-    createJumpConditionsFrom(&BB, CT, LI);
+    createEdgeMasksFrom(&BB, MT, LI);
   }
 
   for (auto &BB : F) {
-    auto Placeholder = cast<Instruction>(CT.blockCondition(&BB));
-    auto RealBlockCond = createBlockCondition(&BB, CT, LI);
+    auto Placeholder = cast<Instruction>(MT.blockMask(&BB));
+    auto RealBlockCond = createBlockMask(&BB, MT, LI);
     Placeholder->replaceAllUsesWith(RealBlockCond);
     Placeholder->eraseFromParent();
   }
 
-  // Finally, combine the loop exit conditions.
+  // Finally, combine the loop exit masks.
   for (Loop *L : LI) {
-    combinedLoopExitCondition(L, CT, LI);
+    combinedLoopExitMask(L, MT, LI);
   }
 
-  return CT;
+  return MT;
 }
 
 struct InstVectorizeVisitor : InstVisitor<InstVectorizeVisitor> {
@@ -629,7 +621,8 @@ struct InstVectorizeVisitor : InstVisitor<InstVectorizeVisitor> {
     auto PtrVec = getVectorized(Load.getOperand(0));
     auto Mask = tryGetMask(&Load);
     bool IsMasked = Mask != nullptr;
-    // TODO consider always masking loads even if they are save to speculate
+    // TODO always mask loads even if they are safe to speculate, to conserve
+    // memory bandwidth
     if (!Mask) {
       Mask = ConstantVector::getSplat(SIMD_WIDTH, getBuilder().getTrue());
     }
@@ -656,9 +649,9 @@ struct InstVectorizeVisitor : InstVisitor<InstVectorizeVisitor> {
 
   void visitPHINode(PHINode &Phi) {
     assert(LI.isLoopHeader(Phi.getParent()));
-    // Because this is a loop, many incoming values aren't vectorized already.
-    // So we don't attempt to lift the incoming values just yet, instead waiting
-    // until we encounter the terminator of the loop latch.
+    // Incoming values from the backedge aren't vectorized yet.
+    // So we delay handling the incoming values  until we encounter the
+    // terminator of the loop latch.
     auto VecPhi = getBuilder().CreatePHI(getVectorType(Phi.getType()),
                                          Phi.getNumIncomingValues());
     record(&Phi, VecPhi, MaskMode::Ignore);
@@ -698,9 +691,9 @@ struct InstVectorizeVisitor : InstVisitor<InstVectorizeVisitor> {
   }
 
   Value *tryGetMask(Instruction *I) {
-    if (auto MD = I->getMetadata(CONDITION_METADATA_ID)) {
-      auto Cond = cast<ValueAsMetadata>(&*MD->getOperand(0))->getValue();
-      return getVectorized(Cond);
+    if (auto MD = I->getMetadata(MASK_METADATA_ID)) {
+      auto ScalarMask = cast<ValueAsMetadata>(&*MD->getOperand(0))->getValue();
+      return getVectorized(ScalarMask);
     }
     return nullptr;
   }
@@ -711,7 +704,7 @@ struct InstVectorizeVisitor : InstVisitor<InstVectorizeVisitor> {
     } else {
       std::string msg;
       raw_string_ostream Msg(msg);
-      Msg << "LowerSPMD: condition metadata missing on: ";
+      Msg << "LowerSPMD: mask metadata missing on: ";
       I->print(Msg);
       report_fatal_error(Msg.str());
     }
@@ -740,12 +733,12 @@ struct InstVectorizeVisitor : InstVisitor<InstVectorizeVisitor> {
 
     switch (Mode) {
     case MaskMode::Unmasked:
-      assert(!Scalar->getMetadata(CONDITION_METADATA_ID) &&
-             "Instruction supposedly masked, but has no condition");
+      assert(!Scalar->getMetadata(MASK_METADATA_ID) &&
+             "Instruction supposedly masked, but has no mask metadata");
       break;
     case MaskMode::Masked:
-      assert(Scalar->getMetadata(CONDITION_METADATA_ID) &&
-             "Instruction supposedly unmasked, but has condition");
+      assert(Scalar->getMetadata(MASK_METADATA_ID) &&
+             "Instruction supposedly unmasked, but has mask metadata");
       break;
     case MaskMode::Ignore:
       /* Nothing */
@@ -911,10 +904,9 @@ struct FunctionVectorizer {
       : Context(F.getContext()), VectorFunc(&VF),
         VectorizedFunctions(VectorizedFunctions) {
     // We need to clone the source function already before mask computation to
-    // insert the i1 argument (the condition for the entry block). We then
-    // linearize that copy in-place. Vectorization, however, creates a new
-    // function (it can't easily work in-place because the types of all
-    // instructions change).
+    // insert the i1 argument (the mask for the entry block). We then linearize
+    // that copy in-place. Vectorization, however, creates a new function (it
+    // can't easily work in-place because the types of all instructions change).
     // TODO find a better name than "LinearFunc"
     ValueToValueMapTy ArgMapping;
     SmallVector<ReturnInst *, 1> Returns;
@@ -951,7 +943,7 @@ struct FunctionVectorizer {
   }
 
   // Create an empty function with the same prototype as F, except that an
-  // additional i1 argument (the condition for the entry block) is inserted
+  // additional i1 argument (the mask for the entry block) is inserted
   // before the first argument.
   // Also fills out a mapping from the input function's arguments to the
   // output
@@ -968,7 +960,7 @@ struct FunctionVectorizer {
     auto NewF =
         Function::Create(NewFT, F.getLinkage(), F.getName(), F.getParent());
     auto NewArgsIter = NewF->arg_begin();
-    ++NewArgsIter; // skip the condition we added
+    ++NewArgsIter; // skip the mask we added
     for (auto &OldArg : F.args()) {
       assert(NewArgsIter != NewF->arg_end());
       ArgMapping[&OldArg] = &*NewArgsIter;
@@ -978,7 +970,7 @@ struct FunctionVectorizer {
     return NewF;
   }
 
-  std::vector<BasicBlock *> linearizeCFG(ConditionTable &CT) {
+  std::vector<BasicBlock *> linearizeCFG(MaskTable &MT) {
     std::vector<BasicBlock *> LinearOrder;
     if (auto LinearOrderOpt = findLinearOrder(LinearFunc, LI)) {
       LinearOrder = std::move(LinearOrderOpt.getValue());
@@ -996,15 +988,15 @@ struct FunctionVectorizer {
       BasicBlock *BB = LinearOrder[i];
       DEBUG(dbgs() << "Linearizing " << BB->getName() << "\n");
 
-      Value *BlockCond = CT.blockCondition(BB);
+      Value *BlockCond = MT.blockMask(BB);
       for (Instruction &I : *BB) {
         if (!isSafeToSpeculativelyExecute(&I)) {
-          markAsConditional(&I, BlockCond);
+          markAsMasked(&I, BlockCond);
         }
       }
 
       if (!LI.isLoopHeader(BB)) {
-        PhisToSelect(BB, CT);
+        PhisToSelect(BB, MT);
       }
 
       if (auto Ret = dyn_cast<ReturnInst>(BB->getTerminator())) {
@@ -1021,7 +1013,7 @@ struct FunctionVectorizer {
 
       if (i + 1 < LinearOrder.size()) {
         BasicBlock *NextBB = LinearOrder[i + 1];
-        linearizeTerminator(BB, NextBB, CT);
+        linearizeTerminator(BB, NextBB, MT);
         NextBB->moveAfter(BB);
       }
     }
@@ -1029,8 +1021,8 @@ struct FunctionVectorizer {
   }
 
   // Turns phis into selects and records the masks for instructions
-  // that need to be made conditional.
-  void PhisToSelect(BasicBlock *BB, ConditionTable &CT) {
+  // that need to be masked.
+  void PhisToSelect(BasicBlock *BB, MaskTable &MT) {
     // Need manual iterator fiddling because we remove the *current*
     // instruction, so we can't advance the iterator at the *end* of the loop
     // iteration as usual
@@ -1038,13 +1030,13 @@ struct FunctionVectorizer {
       Instruction *I = &*Iter;
       ++Iter;
       if (auto *Phi = dyn_cast<PHINode>(I)) {
-        PhiToSelect(Phi, CT);
+        PhiToSelect(Phi, MT);
       }
     }
   }
 
   void linearizeTerminator(BasicBlock *CurrentBB, BasicBlock *NextBB,
-                           ConditionTable &CT) {
+                           MaskTable &MT) {
     Loop *L = LI.getLoopFor(CurrentBB);
     if (L && L->getLoopLatch() == CurrentBB) {
       DEBUG(dbgs() << "linearizeTerminator: " << CurrentBB->getName() << " -> "
@@ -1065,7 +1057,7 @@ struct FunctionVectorizer {
         // `true` and on `false` we carry on with the linearization.
         Br->setSuccessor(0, Header);
         Br->setSuccessor(1, NextBB);
-        Br->setCondition(CT.jumpCondition(CurrentBB, Header));
+        Br->setCondition(MT.edgeMask(CurrentBB, Header));
       }
     } else {
       ReplaceInstWithInst(CurrentBB->getTerminator(),
@@ -1073,28 +1065,27 @@ struct FunctionVectorizer {
     }
   }
 
-  void markAsConditional(Instruction *Inst, Value *Condition) {
-    assert(!Inst->getMetadata(CONDITION_METADATA_ID) &&
-           "Instruction already conditional");
-    auto CondMD = ValueAsMetadata::get(Condition);
-    Inst->setMetadata(CONDITION_METADATA_ID, MDNode::get(Context, CondMD));
+  void markAsMasked(Instruction *Inst, Value *Mask) {
+    assert(!Inst->getMetadata(MASK_METADATA_ID) &&
+           "Instruction already masked");
+    auto CondMD = ValueAsMetadata::get(Mask);
+    Inst->setMetadata(MASK_METADATA_ID, MDNode::get(Context, CondMD));
   }
 
-  void PhiToSelect(PHINode *Phi, ConditionTable &CT) {
+  void PhiToSelect(PHINode *Phi, MaskTable &MT) {
     auto Result = Phi->getIncomingValue(0);
     auto BB = Phi->getParent();
     IRBuilder<> Builder(Phi);
     for (unsigned i = 1; i < Phi->getNumIncomingValues(); ++i) {
-      auto Cond = CT.jumpCondition(Phi->getIncomingBlock(i), BB);
-      Result = Builder.CreateSelect(Cond, Phi->getIncomingValue(i), Result,
+      auto Mask = MT.edgeMask(Phi->getIncomingBlock(i), BB);
+      Result = Builder.CreateSelect(Mask, Phi->getIncomingValue(i), Result,
                                     Phi->getName());
     }
     Phi->replaceAllUsesWith(Result);
     Phi->eraseFromParent();
   }
 
-  Value *createLoopResultInstructions(Instruction &I,
-                                      const ConditionTable &CT) {
+  Value *createLoopResultInstructions(Instruction &I, const MaskTable &MT) {
     Loop *DefLoop = LI.getLoopFor(I.getParent());
     DenseMap<Loop *, PHINode *> Phis;
     // First, insert phis in all loop levels, but don't fill them yet.
@@ -1104,7 +1095,7 @@ struct FunctionVectorizer {
     }
 
     // Then, insert the actual update operation in the latch
-    auto CombExitCond = CT.combinedLoopExitCondition(DefLoop);
+    auto CombExitCond = MT.combinedLoopExitMask(DefLoop);
     IRBuilder<> UpdateBuilder(DefLoop->getLoopLatch()->getTerminator());
     auto Update = UpdateBuilder.CreateSelect(CombExitCond, &I, Phis[DefLoop]);
     Update->setName("loopres." + I.getName());
@@ -1123,7 +1114,7 @@ struct FunctionVectorizer {
     return Update;
   }
 
-  void insertLoopResult(Instruction &I, const ConditionTable &CT) {
+  void insertLoopResult(Instruction &I, const MaskTable &MT) {
     Loop *L = LI.getLoopFor(I.getParent());
     SmallVector<Use *, 8> UsesOutsideLoop;
     for (Use &U : I.uses()) {
@@ -1137,30 +1128,30 @@ struct FunctionVectorizer {
     }
     assert(UsesOutsideLoop.size() > 0 &&
            "Inserted loop result for instruction that does not need one");
-    auto LoopResult = createLoopResultInstructions(I, CT);
+    auto LoopResult = createLoopResultInstructions(I, MT);
     for (Use *U : UsesOutsideLoop) {
       U->set(LoopResult);
     }
   }
 
   Function *run() {
-    ConditionTable CT = createConditions(*LinearFunc, LI);
+    MaskTable MT = createMasks(*LinearFunc, LI);
 
     DEBUG(dbgs() << "===================================================\n");
-    DEBUG(CT.print(dbgs()));
+    DEBUG(MT.print(dbgs()));
     DEBUG(LI.print(dbgs()));
     DEBUG(dbgs() << "\n");
 
     DEBUG(dbgs() << "===================================================\n");
     for (Instruction *I : LoopLiveValues) {
-      insertLoopResult(*I, CT);
+      insertLoopResult(*I, MT);
     }
 
     DEBUG(dbgs() << "===================================================\n");
     DEBUG(LinearFunc->print(dbgs()));
 
     DEBUG(dbgs() << "===================================================\n");
-    auto LinearOrder = linearizeCFG(CT);
+    auto LinearOrder = linearizeCFG(MT);
     DEBUG(LinearFunc->print(dbgs()));
 
     DEBUG(dbgs() << "===================================================\n");
