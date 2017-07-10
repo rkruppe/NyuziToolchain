@@ -34,6 +34,9 @@ template <typename T> using BBMap = DenseMap<const BasicBlock *, T>;
 // Right Thing after vectorization.
 class MaskTable {
   using VH = TrackingVH<Value>;
+  template <typename T>
+  using EdgeMap =
+      DenseMap<std::pair<const BasicBlock *, const BasicBlock *>, T>;
 
   // For each BB, stores the block mask, which lanes are executing the block.
   BBMap<VH> BlockMasks;
@@ -45,19 +48,19 @@ class MaskTable {
   // FIXME the representation is fine, but the mask generation will fall apart
   // if there are multiple edges between two blocks. Other code may also need to
   // be rewritten to support this.
-  BBMap<BBMap<VH>> EdgeMasks;
+  EdgeMap<VH> EdgeMasks;
 
   // Like the edge mask, but not accumulated across iterations in case of loop
   // exits. In other words, this mask indicates whether the *current*
   // iteration left the loop. This is only needed for loop results.
   // FIXME see EdgeMasks re: multiple edges between a pair of blocks
-  BBMap<BBMap<VH>> SingleJumpMasks;
+  EdgeMap<VH> SingleJumpMasks;
 
   // The loop exit mask for a single exit with respect to a loop L.
   // This mask is accumulated over all iterations of child loops of L, but
   // unlike the edge mask for (From, To) it is not accumulated over
   // iterations of L and parent loops of L.
-  BBMap<BBMap<DenseMap<Loop *, VH>>> LoopExitMasks;
+  EdgeMap<DenseMap<Loop *, VH>> LoopExitMasks;
 
   // For each loop, stores the combined loop exit mask, i.e. the scalar
   // equivalent of the combined loop exit mask which encodes which lanes left
@@ -75,21 +78,24 @@ public:
   }
 
   void addJump(const BasicBlock *From, const BasicBlock *To, Value *Mask) {
-    assert(EdgeMasks[From].count(To) == 0 && "Added edge twice");
-    EdgeMasks[From][To] = Mask;
+    auto E = std::make_pair(From, To);
+    assert(EdgeMasks.count(E) == 0 && "Added edge twice");
+    EdgeMasks[E] = Mask;
   }
 
   void addSingleJump(const BasicBlock *From, const BasicBlock *To,
                      Value *Mask) {
-    assert(SingleJumpMasks[From].count(To) == 0 && "Added edge twice");
-    SingleJumpMasks[From][To] = Mask;
+    auto E = std::make_pair(From, To);
+    assert(SingleJumpMasks.count(E) == 0 && "Added edge twice");
+    SingleJumpMasks[E] = Mask;
   }
 
   void addLoopExit(Loop *L, const BasicBlock *From, const BasicBlock *To,
                    Value *Mask) {
-    assert(LoopExitMasks.lookup(From).lookup(To).count(L) == 0 &&
-           "Added loop exit twice");
-    LoopExitMasks[From][To][L] = Mask;
+    auto E = std::make_pair(From, To);
+    // FIXME the .lookup copies the entire inner map
+    assert(LoopExitMasks.lookup(E).count(L) == 0 && "Added loop exit twice");
+    LoopExitMasks[E][L] = Mask;
   }
 
   void addCombinedLoopExit(Loop *L, Value *Mask) {
@@ -103,27 +109,28 @@ public:
   }
 
   Value *edgeMask(const BasicBlock *From, const BasicBlock *To) const {
-    // TODO this copies the entire inner DenseMap =/
-    assert(EdgeMasks.lookup(From).count(To) && "Unknown jump");
-    return EdgeMasks.lookup(From).lookup(To);
+    auto E = std::make_pair(From, To);
+    assert(EdgeMasks.count(E) && "Unknown edge");
+    return EdgeMasks.lookup(E);
   }
 
   Value *lookupLoopExit(Loop *L, const BasicBlock *From,
                         const BasicBlock *To) const {
-    // TODO this copies the entire inner DenseMap =/
-    const auto &TableForLoop = LoopExitMasks.lookup(From).lookup(To);
+    auto E = std::make_pair(From, To);
+    // FIXME lookup copies the entire inner map
+    const auto &TableForEdge = LoopExitMasks.lookup(E);
     // This dance is needed because VH can't be default-constructed
-    if (TableForLoop.count(L) != 0) {
-      return TableForLoop.lookup(L);
+    if (TableForEdge.count(L) != 0) {
+      return TableForEdge.lookup(L);
     } else {
       return nullptr;
     }
   }
 
   Value *singleJumpMask(const BasicBlock *From, const BasicBlock *To) const {
-    // TODO this copies the entire inner DenseMap =/
-    assert(SingleJumpMasks.lookup(From).count(To) && "Unknown jump");
-    return SingleJumpMasks.lookup(From).lookup(To);
+    auto E = std::make_pair(From, To);
+    assert(SingleJumpMasks.count(E) && "Unknown edge");
+    return SingleJumpMasks.lookup(E);
   }
 
   Value *combinedLoopExitMask(Loop *L) const {
@@ -145,12 +152,9 @@ public:
       Dump(BlockMasks[&BB]);
     }
     for (auto &From : F) {
-      for (auto &To : F) {
-        if (EdgeMasks[&From].count(&To) == 0) {
-          continue;
-        }
-        os << "Edge mask " << From.getName() << " -> " << To.getName() << ": ";
-        Dump(EdgeMasks[&From][&To]);
+      for (auto To : successors(&From)) {
+        os << "Edge mask " << From.getName() << " -> " << To->getName() << ": ";
+        Dump(EdgeMasks[std::make_pair(&From, To)]);
       }
     }
     // TODO print {,combined} loop exit masks
