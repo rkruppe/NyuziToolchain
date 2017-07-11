@@ -2,6 +2,7 @@
 #include "llvm/ADT/PostOrderIterator.h"
 #include "llvm/ADT/SCCIterator.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/Statistic.h"
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/ValueTracking.h"
 #include "llvm/IR/BasicBlock.h"
@@ -19,6 +20,10 @@
 using namespace llvm;
 
 #define DEBUG_TYPE "lowerspmd"
+STATISTIC(NumFunctionsSPMDVectorized,
+          "Number of functions that were vectorized by LowerSPMD");
+STATISTIC(NumFunctionsNotSPMDVectorizable,
+          "Number of functions that could not be vectorized by LowerSPMD");
 
 namespace {
 
@@ -428,12 +433,28 @@ struct InstVectorizeVisitor : InstVisitor<InstVectorizeVisitor> {
   }
 
   void visitReturnInst(ReturnInst &Ret) {
-    // Previous steps ensure there's only one return per function.
+    // Previous steps ensure there's only one return, at the end of the
+    // function.
     if (auto RetVal = Ret.getReturnValue()) {
       auto VecReturn = getBuilder().CreateRet(getVectorized(RetVal));
       record(&Ret, VecReturn, MaskMode::Ignore);
     } else {
       getBuilder().CreateRetVoid();
+    }
+  }
+
+  void visitUnreachable(UnreachableInst &Unreachable) {
+    // Normally unreachables are removed in favor of a branch to the next block
+    // or the return. However, if there is no return, an unreachable might
+    // survive linearization. In that case function can't return normally, so we
+    // should just keep it... except that the function might be called with an
+    // all-zero mask, in which case none of the lanes would execute the
+    // unreachable. So to be safe, we just return undef.
+    auto RetTy = VectorFunc.getReturnType();
+    if (RetTy->isVoidTy()) {
+      getBuilder().CreateRetVoid();
+    } else {
+      getBuilder().CreateRet(UndefValue::get(RetTy));
     }
   }
 
@@ -525,8 +546,10 @@ struct InstVectorizeVisitor : InstVisitor<InstVectorizeVisitor> {
     assert(!I->getParent());
     auto OldBB = CurrentBB;
     auto CondBB = BasicBlock::Create(Context, CondBlockName, &VectorFunc);
+    CondBB->moveAfter(OldBB);
     auto NextBB = BasicBlock::Create(Context, CurrentBB->getName() + ".cont",
                                      &VectorFunc);
+    NextBB->moveAfter(CondBB);
     SplitBlockEnd[OldBB] = NextBB; // BUG: this creates a chain through the
                                    // split blocks, not a direct link from the
                                    // start to the last one
@@ -563,7 +586,7 @@ struct InstVectorizeVisitor : InstVisitor<InstVectorizeVisitor> {
       auto Builder = getBuilder();
       auto NeedCall =
           Builder.CreateICmpNE(Builder.CreateBitCast(Mask, MaskIntTy),
-                               ConstantInt::get(MaskIntTy, 0), "need_call");
+                               ConstantInt::get(MaskIntTy, 0));
 
       // TODO transplant attributes as appropriate
       // (some, especially argument attributes, may not apply)
@@ -735,20 +758,23 @@ struct InstVectorizeVisitor : InstVisitor<InstVectorizeVisitor> {
     }
     Vectorized->setName(Scalar->getName());
 
-    DEBUG(dbgs() << "Replacing scalar instruction:\n");
-    DEBUG(Scalar->print(dbgs()));
-    DEBUG(dbgs() << "\nwith vectorized instruction:\n");
-    DEBUG(Vectorized->print(dbgs()));
-    DEBUG(dbgs() << "\n");
-
     switch (Mode) {
     case MaskMode::Unmasked:
-      assert(!shouldBeMasked(Scalar) &&
-             "Instruction should have been masked but wasn't");
+      if (shouldBeMasked(Scalar)) {
+        std::string Msg;
+        raw_string_ostream OS(Msg);
+        OS << "Instruction should have been masked but wasn't: " << *Scalar
+           << "\n";
+        report_fatal_error(Msg.c_str());
+      }
       break;
     case MaskMode::Masked:
-      assert(shouldBeMasked(Scalar) &&
-             "Instruction was masked but shouldn't be");
+      if (!shouldBeMasked(Scalar)) {
+        std::string Msg;
+        raw_string_ostream OS(Msg);
+        OS << "Instruction was masked but shouldn't be: " << *Scalar << "\n";
+        report_fatal_error(Msg.c_str());
+      }
       break;
     case MaskMode::Ignore:
       /* Nothing */
@@ -806,14 +832,20 @@ struct InstVectorizeVisitor : InstVisitor<InstVectorizeVisitor> {
   }
 };
 
-bool isReducible(const std::vector<BasicBlock *> &SCC, Loop *L) {
-  if (!L) {
-    // If there's no Loop object for some BB in the SCC, it's part of a weird
-    // loop that is not reducible.
-    return false;
+Loop *largestLoopIfReducible(const std::vector<BasicBlock *> &SCC,
+                             LoopInfo &LI) {
+  assert(!SCC.empty());
+  // The SCC is reducible iff there is a Loop containing all blocks.
+  Loop *L = LI.getLoopFor(SCC[0]);
+  while (L && L->getParentLoop()) {
+    L = L->getParentLoop();
   }
-  return std::all_of(SCC.begin(), SCC.end(),
-                     [=](BasicBlock *BB) { return L->contains(BB); });
+  if (L && std::all_of(SCC.begin(), SCC.end(),
+                       [=](BasicBlock *BB) { return L->contains(BB); })) {
+    return L;
+  } else {
+    return nullptr;
+  }
 }
 
 struct ToposortState {
@@ -877,11 +909,8 @@ Optional<std::vector<BasicBlock *>> findLinearOrder(Function *F, LoopInfo &LI) {
   for (auto I = scc_begin(F); !I.isAtEnd(); ++I) {
     const std::vector<BasicBlock *> &SCC = *I;
     if (I.hasLoop()) {
-      Loop *L = LI.getLoopFor(SCC[0]);
-      while (L && L->getParentLoop()) {
-        L = L->getParentLoop();
-      }
-      if (!isReducible(SCC, L)) {
+      Loop *L = largestLoopIfReducible(SCC, LI);
+      if (!L) {
         return None;
       }
       // TODO check whether the loop is canonical
@@ -924,7 +953,7 @@ struct FunctionVectorizer {
     CloneFunctionInto(LinearFunc, &F, ArgMapping,
                       /* ModuleLevelChanges: */ false, Returns);
 
-    if (Returns.size() != 1) {
+    if (Returns.size() > 1) {
       report_fatal_error("LowerSPMD: cannot vectorize function with multiple "
                          "returns, run mergereturn");
     }
@@ -1002,19 +1031,18 @@ struct FunctionVectorizer {
         PhisToSelect(BB, MT);
       }
 
-      if (auto Ret = dyn_cast<ReturnInst>(BB->getTerminator())) {
-        // Because of blocks ending with unreachable, the return instruction
-        // may not come last in the topological ordering. So we forcibly put the
-        // return into the last block.
-        TerminatorInst *LastTerminator = LinearOrder.back()->getTerminator();
-        if (Ret != LastTerminator) {
-          assert(isa<UnreachableInst>(LastTerminator));
-          ReplaceInstWithInst(LastTerminator, Ret);
-          LastTerminator->eraseFromParent();
-        }
-      }
-
       if (i + 1 < LinearOrder.size()) {
+        if (auto Ret = dyn_cast<ReturnInst>(BB->getTerminator())) {
+          // Because of blocks ending with unreachable, the return instruction
+          // may not come last in the topological ordering. So we overwrite the
+          // last terminator with a return.
+          TerminatorInst *LastTerminator = LinearOrder.back()->getTerminator();
+          assert(isa<UnreachableInst>(LastTerminator));
+          ReplaceInstWithInst(
+              LastTerminator,
+              ReturnInst::Create(Context, Ret->getReturnValue()));
+        }
+
         BasicBlock *NextBB = LinearOrder[i + 1];
         linearizeTerminator(BB, NextBB, MT);
         NextBB->moveAfter(BB);
@@ -1134,6 +1162,7 @@ struct FunctionVectorizer {
     MaskTable MT = createMasks(*LinearFunc, LI);
 
     DEBUG(dbgs() << "===================================================\n");
+    DEBUG(dbgs() << "Vectorizing " << LinearFunc->getName() << "\n");
     DEBUG(MT.print(dbgs()));
     DEBUG(LI.print(dbgs()));
     DEBUG(dbgs() << "\n");
@@ -1164,55 +1193,182 @@ struct FunctionVectorizer {
   }
 };
 
-struct FindDirectCalls : InstVisitor<FindDirectCalls> {
-  SmallVector<Function *, 16> Callees;
-
-  void visitCallInst(CallInst &Call) {
-    if (auto F = Call.getCalledFunction()) {
-      Callees.push_back(F);
-    }
-  }
-};
-
 Function *unwrapFunctionBitcast(Value *Bitcast) {
   return cast<Function>(cast<ConstantExpr>(Bitcast)->getOperand(0));
 }
 
-std::vector<Function *>
-findFunctionsToVectorize(const std::vector<CallInst *> &Roots) {
-  SmallPtrSet<Function *, 2> Seen;
-  std::vector<Function *> Worklist;
-  std::vector<Function *> Result;
+struct VectorizationObstacle {
+  Value *Location;
+  StringRef Description;
+};
 
-  auto Consider = [&](Function *F) {
-    if (!F) {
-      report_fatal_error("Indirect call in SPMD code");
-    }
-    if (Seen.insert(F).second) {
-      Worklist.push_back(F);
-    }
-  };
+// This visitor determines whether an instruction involves a vector type (in a
+// way that will cause a problem for this pass)
+struct PreconditionCheckerVisitor : InstVisitor<PreconditionCheckerVisitor> {
+  std::vector<VectorizationObstacle> Obstacles;
+  SmallPtrSet<Type *, 16> SeenTypes;
+  bool SeenReturn = false;
 
-  // The roots of the collection process are the call sites of the intrinsic.
-  for (auto Call : Roots) {
-    Consider(unwrapFunctionBitcast(Call->getArgOperand(0)));
-  };
-
-  while (!Worklist.empty()) {
-    Function *F = Worklist.back();
-    Worklist.pop_back();
-    if (F->empty()) {
-      // This is an external function (e.g., intrinsic) so we have to make do
-      // without it.
-      continue;
+  void checkType(Value *V, Type *Ty,
+                 const char *Msg = "unsupported value type") {
+    if (SeenTypes.count(Ty)) {
+      return;
     }
-    Result.push_back(F);
-    FindDirectCalls FDC;
-    FDC.visit(F);
-    std::for_each(FDC.Callees.begin(), FDC.Callees.end(), Consider);
+    bool TypeOK = Ty->isIntegerTy() || Ty->isFloatTy() || Ty->isPointerTy() ||
+                  Ty->isVoidTy();
+    if (auto IntTy = dyn_cast<IntegerType>(Ty)) {
+      // TODO apparently i64 vectors trigger a backend error?
+      TypeOK &= IntTy->getBitWidth() <= 32;
+    }
+    if (!TypeOK) {
+      SeenTypes.insert(Ty);
+      Obstacles.push_back({V, Msg});
+    }
   }
 
-  return Result;
+  void checkType(Value *V) { checkType(V, V->getType()); }
+
+  void visitFunction(Function &F) {
+    checkType(nullptr, F.getReturnType(), "unsupported return type");
+    for (auto &Arg : F.args()) {
+      checkType(&Arg, Arg.getType(), "unsupported argument type");
+    }
+    SeenReturn = false;
+  }
+
+  void visitInstruction(Instruction &I) {
+    Obstacles.push_back({&I, "unsupported instruction kind"});
+  }
+
+  void visitReturnInst(ReturnInst &Ret) {
+    // Don't need to check type, already checked return type of function
+    if (SeenReturn) {
+      Obstacles.push_back({&Ret, "multiple returns"});
+    }
+    SeenReturn = true;
+  }
+
+  void visitUnreachableInst(UnreachableInst &) {
+    // Nothing to do
+  }
+
+  void visitAllocaInst(AllocaInst &Alloca) {
+    if (Alloca.isArrayAllocation()) {
+      Obstacles.push_back({&Alloca, "array alloca"});
+    }
+    if (Alloca.isUsedWithInAlloca()) {
+      Obstacles.push_back({&Alloca, "inalloca"});
+    }
+    if (!Alloca.isStaticAlloca()) {
+      Obstacles.push_back({&Alloca, "dynamic alloca"});
+    }
+  }
+
+  void visitCallInst(CallInst &Call) {
+    checkType(&Call);
+    std::for_each(Call.arg_begin(), Call.arg_end(),
+                  [&](Value *V) { checkType(V); });
+    if (!Call.getCalledFunction()) {
+      Obstacles.push_back({&Call, "unknown callee"});
+    }
+    if (!shouldBeMasked(&Call)) {
+      Obstacles.push_back({&Call, "unmasked calls not yet implemented"});
+    }
+  }
+
+  void visitIntrinsicInst(IntrinsicInst &Intr) {
+    switch (Intr.getIntrinsicID()) {
+    default:
+      visitCallInst(Intr);
+      break;
+    case Intrinsic::lifetime_start:
+    case Intrinsic::lifetime_end:
+      // These get dropped and their i64 argument causes issues
+      // FIXME this is not ideal, we want and should be able to keep them
+      break;
+    }
+  }
+
+  void visitDbgInfoIntrinsic(DbgInfoIntrinsic &) {
+    // These get dropped
+  }
+
+  void visitCmpInst(CmpInst &Cmp) {
+    checkType(&Cmp);
+    checkType(Cmp.getOperand(0));
+    checkType(Cmp.getOperand(1));
+  }
+
+  void visitBinaryOperator(BinaryOperator &Op) {
+    checkType(&Op);
+    checkType(Op.getOperand(0));
+    checkType(Op.getOperand(1));
+    if (shouldBeMasked(&Op)) {
+      Obstacles.push_back({&Op, "masked binops not yet implemented"});
+    }
+  }
+
+  void visitCastInst(CastInst &Cast) {
+    checkType(&Cast);
+    checkType(Cast.getOperand(0));
+  }
+
+  void visitGetElementPtrInst(GetElementPtrInst &GEP) {
+    // Nothing to do, operands and return values are all integers, pointers,
+    // and
+    // vectors thereof.
+  }
+
+  void visitLoadInst(LoadInst &Load) { checkType(&Load); }
+
+  void visitStoreInst(StoreInst &Store) { checkType(Store.getValueOperand()); }
+
+  void visitSelectInst(SelectInst &Sel) {
+    checkType(&Sel);
+    // Operands have the same type, condition must be i1 or i1 vector
+  }
+
+  void visitPHINode(PHINode &Phi) { checkType(&Phi); }
+
+  void visitBranchInst(BranchInst &Br) {
+    // Nothing to do.
+  }
+};
+
+bool shouldVectorize(Function &F) {
+  PreconditionCheckerVisitor PCV;
+  PCV.visit(F);
+  // FIXME: for performance, only accumulate obstacles in debug mode
+  // in release mode we should short circuit once we find any obstacle
+  auto Obstacles = std::move(PCV.Obstacles);
+
+  // Check reducibility
+  DominatorTree DomTree(F);
+  LoopInfo LI(DomTree);
+  for (auto I = scc_begin(&F); !I.isAtEnd(); ++I) {
+    const std::vector<BasicBlock *> &SCC = *I;
+    if (I.hasLoop()) {
+      Loop *L = largestLoopIfReducible(SCC, LI);
+      if (!L) {
+        Obstacles.push_back({nullptr, "irreducible control flow"});
+        break;
+      }
+    }
+  }
+  // TODO check other obstacles
+  if (Obstacles.empty()) {
+    return true;
+  }
+  DEBUG(dbgs() << "Will not vectorize function " << F.getName()
+               << " because:\n");
+  for (auto &O : Obstacles) {
+    DEBUG(dbgs() << "\t" << O.Description);
+    if (O.Location) {
+      DEBUG(dbgs() << ": " << *O.Location);
+    }
+    DEBUG(dbgs() << "\n");
+  }
+  return false;
 }
 
 // Create a function with the same signature as ScalarFunc, except that:
@@ -1254,7 +1410,19 @@ struct LowerSPMD : public ModulePass {
       RootCalls.push_back(cast<CallInst>(U));
     }
 
-    auto ScalarFuncs = findFunctionsToVectorize(RootCalls);
+    std::vector<Function *> ScalarFuncs;
+    for (auto &F : M) {
+      if (F.empty()) {
+        continue;
+      }
+      if (shouldVectorize(F)) {
+        ScalarFuncs.push_back(&F);
+        NumFunctionsSPMDVectorized++;
+      } else {
+        NumFunctionsNotSPMDVectorizable++;
+      }
+    }
+
     DenseMap<Function *, Function *> Vectorized;
     // Vectorized functions may call each other (including recursively), so
     // declare vectorized versions of all functions before defining any.
@@ -1265,13 +1433,22 @@ struct LowerSPMD : public ModulePass {
       FunctionVectorizer FV(*F, *Vectorized[F], Vectorized);
       FV.run();
     }
-    DEBUG(dbgs() << "===================================================\n");
 
     for (auto Call : RootCalls) {
       auto ScalarF = unwrapFunctionBitcast(Call->getArgOperand(0));
       auto Arg = Call->getArgOperand(1);
+      DEBUG(dbgs() << "Replacing spmd.call to " << ScalarF->getName() << "\n");
       IRBuilder<> Builder(Call);
-      assert(Vectorized.count(ScalarF));
+      auto VectorF = Vectorized.lookup(ScalarF);
+      if (!VectorF) {
+        std::string Msg;
+        {
+          raw_string_ostream OS(Msg);
+          OS << "SPMD call to function that could not be vectorized: "
+             << ScalarF->getName() << "\n";
+        }
+        report_fatal_error(Msg.c_str());
+      }
 
       SmallVector<Value *, 2> Args;
       auto True = ConstantInt::getTrue(ScalarF->getContext());
