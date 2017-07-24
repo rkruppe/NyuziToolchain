@@ -186,7 +186,6 @@ void createSingleJumpMasksFrom(BasicBlock *BB, MaskTable &MT, LoopInfo &LI) {
     return;
   }
   auto *Br = cast<BranchInst>(Terminator);
-  // TODO check up-front whether all terminators are unreachable/return/br
   if (Br->isConditional()) {
     IRBuilder<> Builder(Br);
     auto *Cond0 = Br->getCondition();
@@ -913,7 +912,6 @@ Optional<std::vector<BasicBlock *>> findLinearOrder(Function *F, LoopInfo &LI) {
       if (!L) {
         return None;
       }
-      // TODO check whether the loop is canonical
       SCCsLinearized.push_back(loopToposort(L, LI));
     } else {
       SCCsLinearized.push_back({SCC[0]});
@@ -1014,7 +1012,8 @@ struct FunctionVectorizer {
     if (auto LinearOrderOpt = findLinearOrder(LinearFunc, LI)) {
       LinearOrder = std::move(LinearOrderOpt.getValue());
     } else {
-      report_fatal_error("TODO don't even go here");
+      report_fatal_error(
+          "LowerSPMD run on function with irreducible control flow");
     }
 
     DEBUG(dbgs() << "Linear order: ");
@@ -1080,16 +1079,19 @@ struct FunctionVectorizer {
         assert(Br->getSuccessor(0) == Header || Br->getSuccessor(1) == Header);
         assert(!L->contains(Br->getSuccessor(0)) ||
                !L->contains(Br->getSuccessor(1)));
-      } else {
-        assert(Br->getSuccessor(0) == Header);
-      }
-      if (Br->isConditional()) {
-        // Canonicalize conditional branches so that the backedge happens on
-        // `true` and on `false` we carry on with the linearization.
+        // Canonicalize the branch so that the backedge is taken on `true` and
+        // the  loop is exited on `false`.
         Br->setSuccessor(0, Header);
         Br->setSuccessor(1, NextBB);
         Br->setCondition(MT.edgeMask(CurrentBB, Header));
+      } else {
+        assert(Br->getSuccessor(0) == Header);
+        ReplaceInstWithInst(
+            CurrentBB->getTerminator(),
+            BranchInst::Create(Header, NextBB, MT.edgeMask(CurrentBB, Header)));
       }
+      // We need to *make* it conditional, because there's a "next" BB in the
+      // linear order and thus there are loop exits that might be taken.
     } else {
       ReplaceInstWithInst(CurrentBB->getTerminator(),
                           BranchInst::Create(NextBB));
