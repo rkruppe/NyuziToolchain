@@ -38,6 +38,8 @@ public:
   TargetLoweringObjectFile *getObjFileLowering() const override {
     return TLOF.get();
   }
+
+  TargetIRAnalysis getTargetIRAnalysis() override;
 };
 
 } // end namespace llvm

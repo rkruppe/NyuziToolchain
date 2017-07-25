@@ -14,6 +14,7 @@
 #include "MCTargetDesc/NyuziMCTargetDesc.h"
 #include "Nyuzi.h"
 #include "NyuziTargetObjectFile.h"
+#include "NyuziTargetTransformInfo.h"
 #include "llvm/CodeGen/Passes.h"
 #include "llvm/CodeGen/TargetPassConfig.h"
 #include "llvm/IR/LegacyPassManager.h"
@@ -64,6 +65,12 @@ NyuziTargetMachine::NyuziTargetMachine(const Target &T, const Triple &TT,
 
 TargetPassConfig *NyuziTargetMachine::createPassConfig(PassManagerBase &PM) {
   return new NyuziPassConfig(this, PM);
+}
+
+TargetIRAnalysis NyuziTargetMachine::getTargetIRAnalysis() {
+  return TargetIRAnalysis([this](const Function &F) {
+    return TargetTransformInfo(NyuziTTIImpl(this, F));
+  });
 }
 
 bool NyuziPassConfig::addInstSelector() {

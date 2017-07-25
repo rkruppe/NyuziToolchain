@@ -932,4 +932,3 @@ def : Pat<(orlo i32:$val, tblockaddress:$dst), (ORSSI i32:$val, tblockaddress:$d
 
 def : Pat<(movehi tjumptable:$dst), (MOVEHI tjumptable:$dst)>;
 def : Pat<(orlo i32:$val, tjumptable:$dst), (ORSSI i32:$val, tjumptable:$dst)>;
-

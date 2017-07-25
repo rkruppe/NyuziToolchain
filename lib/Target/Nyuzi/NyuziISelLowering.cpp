@@ -60,6 +60,26 @@ SDValue morphSETCCNode(SDValue Op, NyuziISD::NodeType Compare, SelectionDAG &DAG
                      Op.getOperand(0), Op.getOperand(1));
 }
 
+// Masked scatter/gather decomposed the address vector into base + index,
+// where base is a scalar address that all addresses in the vector are
+// derived from. This information is of no real use for our target so we
+// just turn it back into splat(base) + index.
+// If there is no common base pointer, base is a null pointer.
+// Since the DAG combiner can't see through NyuziISD::SPLAT, we need to
+// manually optimize the case where base == 0 (by not emitting an addition)
+SDValue recombineMaskedGatherScatterAddress(MaskedGatherScatterSDNode *Node,
+                                            SelectionDAG &DAG, SDLoc &DL) {
+  if (auto C = dyn_cast<ConstantSDNode>(Node->getBasePtr())) {
+    if (C->isNullValue()) {
+      return Node->getIndex();
+    }
+  }
+  return DAG.getNode(
+      ISD::ADD, DL, MVT::v16i32,
+      DAG.getNode(NyuziISD::SPLAT, DL, MVT::v16i32, Node->getBasePtr()),
+      Node->getIndex());
+}
+
 } // namespace
 
 NyuziTargetLowering::NyuziTargetLowering(const TargetMachine &TM,
@@ -127,7 +147,11 @@ NyuziTargetLowering::NyuziTargetLowering(const TargetMachine &TM,
     { ISD::TRUNCATE, MVT::v16i1 },
     { ISD::ZERO_EXTEND, MVT::v16i32 },
     { ISD::SIGN_EXTEND, MVT::v16i32 },
-    { ISD::JumpTable, MVT::i32 }
+    { ISD::JumpTable, MVT::i32 },
+    { ISD::MGATHER, MVT::v16i32 },
+    { ISD::MGATHER, MVT::v16f32 },
+    { ISD::MSCATTER, MVT::v16i32 },
+    { ISD::MSCATTER, MVT::v16f32 },
   };
 
   for (auto Action : CustomActions)
@@ -287,6 +311,10 @@ SDValue NyuziTargetLowering::LowerOperation(SDValue Op,
   case ISD::FP_TO_SINT:
   case ISD::FP_TO_UINT:
     return LowerFP_TO_XINT(Op, DAG);
+  case ISD::MGATHER:
+    return LowerMGATHER(Op, DAG);
+  case ISD::MSCATTER:
+    return LowerMSCATTER(Op, DAG);
   case ISD::JumpTable:
     return LowerJumpTable(Op, DAG);
   default:
@@ -1491,6 +1519,59 @@ SDValue NyuziTargetLowering::LowerFP_TO_XINT(SDValue Op, SelectionDAG &DAG) cons
   SDValue Zero = DAG.getNode(NyuziISD::SPLAT, DL, MVT::v16f32,
                              DAG.getConstantFP(0.0, DL, MVT::f32));
   return DAG.getSetCC(DL, MVT::v16i1, Op.getOperand(0), Zero, ISD::SETNE);
+}
+
+// MGATHER(chain, passthru, mask, base, index)
+SDValue NyuziTargetLowering::LowerMGATHER(SDValue Op, SelectionDAG &DAG) const {
+  SDLoc DL(Op);
+  auto VT = Op.getSimpleValueType();
+  auto Gather = cast<MaskedGatherSDNode>(Op.getNode());
+  SDValue Ptrs = recombineMaskedGatherScatterAddress(Gather, DAG, DL);
+
+  auto VTList = DAG.getVTList(Op.getSimpleValueType(), MVT::Other);
+  if (auto Mask = dyn_cast<ConstantSDNode>(Gather->getMask())) {
+    if (Mask->isAllOnesValue()) {
+      auto Intrin =
+          DAG.getConstant(VT.isFloatingPoint() ? Intrinsic::nyuzi_gather_loadf
+                                               : Intrinsic::nyuzi_gather_loadi,
+                          DL, MVT::i32);
+      return DAG.getNode(ISD::INTRINSIC_W_CHAIN, DL, VTList, Gather->getChain(),
+                         Intrin, Ptrs);
+    }
+  }
+  auto IntrinM = DAG.getConstant(VT.isFloatingPoint()
+                                     ? Intrinsic::nyuzi_gather_loadf_masked
+                                     : Intrinsic::nyuzi_gather_loadi_masked,
+                                 DL, MVT::i32);
+  assert(Gather->getValue()->isUndef() && "TODO: vselect with passthru value");
+  return DAG.getNode(ISD::INTRINSIC_W_CHAIN, DL, VTList, Gather->getChain(),
+                     IntrinM, Ptrs, Gather->getMask());
+}
+
+// MSCATTER(chain, value, mask, base, index)
+SDValue NyuziTargetLowering::LowerMSCATTER(SDValue Op,
+                                           SelectionDAG &DAG) const {
+  SDLoc DL(Op);
+  auto VT = Op.getSimpleValueType();
+  auto Scatter = cast<MaskedScatterSDNode>(Op.getNode());
+  SDValue Ptrs = recombineMaskedGatherScatterAddress(Scatter, DAG, DL);
+  if (auto Mask = dyn_cast<ConstantSDNode>(Scatter->getMask())) {
+    if (Mask->isAllOnesValue()) {
+      auto Intrin = DAG.getConstant(VT.isFloatingPoint()
+                                        ? Intrinsic::nyuzi_scatter_storef
+                                        : Intrinsic::nyuzi_scatter_storei,
+                                    DL, MVT::i32);
+      return DAG.getNode(ISD::INTRINSIC_VOID, DL, MVT::Other,
+                         Scatter->getChain(), Intrin, Ptrs,
+                         Scatter->getValue());
+    }
+  }
+  auto IntrinM = DAG.getConstant(VT.isFloatingPoint()
+                                     ? Intrinsic::nyuzi_scatter_storef_masked
+                                     : Intrinsic::nyuzi_scatter_storei_masked,
+                                 DL, MVT::i32);
+  return DAG.getNode(ISD::INTRINSIC_VOID, DL, MVT::Other, Scatter->getChain(),
+                     IntrinM, Ptrs, Scatter->getValue(), Scatter->getMask());
 }
 
 MachineBasicBlock *
