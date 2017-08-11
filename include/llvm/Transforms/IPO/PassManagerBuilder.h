@@ -148,6 +148,7 @@ public:
   bool BBVectorize;
   bool SLPVectorize;
   bool LoopVectorize;
+  bool SPMDVectorize;
   bool RerollLoops;
   bool LoadCombine;
   bool NewGVN;

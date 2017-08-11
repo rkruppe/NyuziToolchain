@@ -40,6 +40,7 @@
 #include "llvm/Transforms/Scalar/GVN.h"
 #include "llvm/Transforms/Scalar/SimpleLoopUnswitch.h"
 #include "llvm/Transforms/Vectorize.h"
+#include "llvm/Transforms/Utils/UnifyFunctionExitNodes.h"
 
 using namespace llvm;
 
@@ -161,6 +162,7 @@ PassManagerBuilder::PassManagerBuilder() {
     BBVectorize = RunBBVectorization;
     SLPVectorize = RunSLPVectorization;
     LoopVectorize = RunLoopVectorization;
+    SPMDVectorize = false;
     RerollLoops = RunLoopRerolling;
     LoadCombine = RunLoadCombine;
     NewGVN = RunNewGVN;
@@ -580,6 +582,18 @@ void PassManagerBuilder::populateModulePassManager(
   MPM.add(createFloat2IntPass());
 
   addExtensionsToPM(EP_VectorizerStart, MPM);
+
+  if (SPMDVectorize) {
+    // TODO should probably run lowerswitch, but first figure out
+    // if we can do that only to vectorized copies
+    MPM.add(createUnifyFunctionExitNodesPass());
+    MPM.add(createLoopSimplifyPass());
+    MPM.add(createLowerSPMDPass());
+    MPM.add(createInstructionCombiningPass());
+    MPM.add(createCFGSimplificationPass());
+    MPM.add(createFunctionInliningPass());
+    MPM.add(createGlobalDCEPass());
+  }
 
   // Re-rotate loops in all our loop nests. These may have fallout out of
   // rotated form due to GVN or other transformations, and the vectorizer relies
