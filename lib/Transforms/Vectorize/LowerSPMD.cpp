@@ -312,6 +312,9 @@ void createCombinedLoopExitMask(Loop *L, MaskTable &MT) {
     Value *ExitCond = MT.exitMask(L, E.first, E.second);
     Combined = Combined ? Builder.CreateOr(Combined, ExitCond) : ExitCond;
   }
+  if (!Combined) {
+    Combined = Builder.getFalse();
+  }
   if (Combined->getName().empty()) {
     Combined->setName(L->getHeader()->getName() + ".combined.exit");
   }
@@ -1357,6 +1360,19 @@ bool shouldVectorize(Function &F) {
       }
     }
   }
+
+  // Check for vararg
+  if (F.getFunctionType()->isVarArg()) {
+    Obstacles.push_back({nullptr, "vararg function"});
+  }
+
+  // Check if loop-simplify was run
+  forallNestedLoops(LI, [&](Loop *L) {
+    if (!L->isLoopSimplifyForm()) {
+      Obstacles.push_back({nullptr, "loop not in canonical form"});
+    }
+  });
+
   // TODO check other obstacles
   if (Obstacles.empty()) {
     return true;
@@ -1398,6 +1414,7 @@ Function *predefineVectorizedFunction(Function &ScalarFunc) {
   if (ScalarFunc.hasFnAttribute(Attribute::NoInline)) {
     VectorFunc->addFnAttr(Attribute::NoInline);
   }
+  VectorFunc->setLinkage(ScalarFunc.getLinkage());
   return VectorFunc;
 }
 
