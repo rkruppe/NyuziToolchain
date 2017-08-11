@@ -46,5 +46,7 @@ BUILTIN(__builtin_nyuzi_mask_cmpf_lt, "UsV16fV16f", "nc")
 BUILTIN(__builtin_nyuzi_mask_cmpf_le, "UsV16fV16f", "nc")
 BUILTIN(__builtin_nyuzi_mask_cmpf_eq, "UsV16fV16f", "nc")
 BUILTIN(__builtin_nyuzi_mask_cmpf_ne, "UsV16fV16f", "nc")
+BUILTIN(__builtin_nyuzi_spmd_lane_id, "z", "nc")
+BUILTIN(__builtin_nyuzi_spmd_call, "vv*v*", "")
 
 #undef BUILTIN

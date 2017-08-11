@@ -8148,6 +8148,13 @@ Value *CodeGenFunction::EmitNyuziBuiltinExpr(unsigned BuiltinID,
     case Nyuzi::BI__builtin_nyuzi_scatter_storef:
       F = CGM.getIntrinsic(Intrinsic::nyuzi_scatter_storef);
       break;
+    case Nyuzi::BI__builtin_nyuzi_spmd_lane_id:
+      F = CGM.getIntrinsic(Intrinsic::spmd_lane_id);
+      break;
+    case Nyuzi::BI__builtin_nyuzi_spmd_call:
+      F = CGM.getIntrinsic(Intrinsic::spmd_call);
+      Ops[0] = Builder.CreateBitCast(Ops[0], Builder.getInt8PtrTy());
+      break;
   }
 
   if (F)
