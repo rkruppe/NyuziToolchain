@@ -628,9 +628,25 @@ struct InstVectorizeVisitor : InstVisitor<InstVectorizeVisitor> {
   void visitBinaryOperator(BinaryOperator &Op) {
     auto LHS = getVectorized(Op.getOperand(0));
     auto RHS = getVectorized(Op.getOperand(1));
-    auto VecOp = BinaryOperator::Create(Op.getOpcode(), LHS, RHS);
-    // TODO division probably needs to be masked?
-    record(&Op, VecOp, MaskMode::Unmasked);
+    if (auto Mask = tryGetMask(&Op)) {
+      auto Builder = getBuilder();
+      assert(Op.getOpcode() == Instruction::UDiv ||
+             Op.getOpcode() == Instruction::URem ||
+             Op.getOpcode() == Instruction::SDiv ||
+             Op.getOpcode() == Instruction::SRem);
+      auto Bits = Op.getType()->getIntegerBitWidth();
+      // In lanes where the mask is 0, executing the operation as-is may be UB
+      // (e.g., because the divisor is zero). So we replace those lanes with a
+      // value that makes the operation defined.
+      auto SafeValue = Builder.getIntN(Bits, 1);
+      auto SafeRHS = Builder.CreateSelect(
+          Mask, RHS, Builder.CreateVectorSplat(SIMD_WIDTH, SafeValue));
+      auto VecOp = BinaryOperator::Create(Op.getOpcode(), LHS, SafeRHS);
+      record(&Op, VecOp, MaskMode::Masked);
+    } else {
+      auto VecOp = BinaryOperator::Create(Op.getOpcode(), LHS, RHS);
+      record(&Op, VecOp, MaskMode::Unmasked);
+    }
   }
 
   void visitCastInst(CastInst &Cast) {
@@ -1308,7 +1324,10 @@ struct PreconditionCheckerVisitor : InstVisitor<PreconditionCheckerVisitor> {
     checkType(&Op);
     checkType(Op.getOperand(0));
     checkType(Op.getOperand(1));
-    if (shouldBeMasked(&Op)) {
+    auto Opc = Op.getOpcode();
+    if (shouldBeMasked(&Op) && Opc != Instruction::UDiv &&
+        Opc != Instruction::URem && Opc != Instruction::SDiv &&
+        Opc != Instruction::SRem) {
       Obstacles.push_back({&Op, "masked binops not yet implemented"});
     }
   }
