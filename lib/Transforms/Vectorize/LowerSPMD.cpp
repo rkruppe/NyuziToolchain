@@ -1496,6 +1496,14 @@ struct LowerSPMD : public ModulePass {
       Call->eraseFromParent();
     }
 
+    // HACK HACK HACK
+    auto LaneIdIntr = Intrinsic::getDeclaration(&M, Intrinsic::spmd_lane_id);
+    auto Zero = ConstantInt::get(IntegerType::get(M.getContext(), 32), 0);
+    for (User *U : LaneIdIntr->users()) {
+      cast<CallInst>(U)->replaceAllUsesWith(Zero);
+      cast<CallInst>(U)->eraseFromParent();
+    }
+
     return true;
   }
 };
