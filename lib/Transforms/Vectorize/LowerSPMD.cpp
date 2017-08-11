@@ -1295,6 +1295,11 @@ struct PreconditionCheckerVisitor : InstVisitor<PreconditionCheckerVisitor> {
     if (!shouldBeMasked(&Call)) {
       Obstacles.push_back({&Call, "unmasked calls not yet implemented"});
     }
+    if (auto F = Call.getCalledFunction()) {
+      if (F->getIntrinsicID() == Intrinsic::spmd_call) {
+        Obstacles.push_back({&Call, "nested spmd.call"});
+      }
+    }
   }
 
   void visitIntrinsicInst(IntrinsicInst &Intr) {
