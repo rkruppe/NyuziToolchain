@@ -424,7 +424,8 @@ SDValue NyuziTargetLowering::LowerFormalArguments(
     SDValue FIPtr = DAG.getFrameIndex(FI, getPointerTy(DAG.getDataLayout()));
     SDValue Load;
     if (VA.getValVT() == MVT::i32 || VA.getValVT() == MVT::f32 ||
-        VA.getValVT() == MVT::v16i32 || VA.getValVT() == MVT::v16i1) {
+        VA.getValVT() == MVT::v16i32 || VA.getValVT() == MVT::v16f32 ||
+        VA.getValVT() == MVT::v16i1) {
       // Primitive Types are loaded directly from the stack
       Load = DAG.getLoad(VA.getValVT(), DL, Chain, FIPtr, MachinePointerInfo());
     } else {
@@ -1771,8 +1772,8 @@ NyuziTargetLowering::EmitAtomicCmpSwap(MachineInstr &MI,
   BuildMI(BB, DL, TII->get(Nyuzi::BNZ)).addReg(CmpResult).addMBB(ExitMBB);
 
   // Loop2MBB:
-  //   move success, newval			; need a temporary because
-  //   store.sync success, 0(Ptr)	; store.sync will clobber success
+  //   move success, newval     ; need a temporary because
+  //   store.sync success, 0(Ptr) ; store.sync will clobber success
   //   bfalse success, Loop1MBB
   BB = Loop2MBB;
   BuildMI(BB, DL, TII->get(Nyuzi::STORE_SYNC), Success)
