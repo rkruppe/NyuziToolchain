@@ -1400,6 +1400,9 @@ def fno_slp_vectorize : Flag<["-"], "fno-slp-vectorize">, Group<f_Group>;
 def fslp_vectorize_aggressive : Flag<["-"], "fslp-vectorize-aggressive">, Group<f_Group>,
   HelpText<"Enable the BB vectorization passes">;
 def fno_slp_vectorize_aggressive : Flag<["-"], "fno-slp-vectorize-aggressive">, Group<f_Group>;
+def fspmd_vectorize : Flag<["-"], "fspmd-vectorize">, Group<f_Group>,
+  HelpText<"Enable the SPMD vectorization passes">;
+def fno_spmd_vectorize : Flag<["-"], "fno-spmd-vectorize">, Group<f_Group>;
 def : Flag<["-"], "ftree-slp-vectorize">, Alias<fslp_vectorize>;
 def : Flag<["-"], "fno-tree-slp-vectorize">, Alias<fno_slp_vectorize>;
 def Wlarge_by_value_copy_def : Flag<["-"], "Wlarge-by-value-copy">,

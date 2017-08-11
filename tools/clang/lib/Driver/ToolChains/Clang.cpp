@@ -1646,6 +1646,15 @@ void Clang::AddWebAssemblyTargetArgs(const ArgList &Args,
   }
 }
 
+void Clang::AddNyuziTargetArgs(const ArgList &Args,
+                               ArgStringList &CmdArgs) const {
+  // Enable the SPMD vectorizer, if vectorizing at all
+  if (shouldEnableVectorizerAtOLevel(Args, false) &&
+      !Args.hasArg(options::OPT_fno_spmd_vectorize)) {
+    CmdArgs.push_back("-vectorize-spmd");
+  }
+}
+
 void Clang::DumpCompilationDatabase(Compilation &C, StringRef Filename,
                                     StringRef Target, const InputInfo &Output,
                                     const InputInfo &Input, const ArgList &Args) const {
@@ -2627,6 +2636,9 @@ void Clang::ConstructJob(Compilation &C, const JobAction &JA,
   case llvm::Triple::wasm64:
     AddWebAssemblyTargetArgs(Args, CmdArgs);
     break;
+
+  case llvm::Triple::nyuzi:
+    AddNyuziTargetArgs(Args, CmdArgs);
   }
 
   // The 'g' groups options involve a somewhat intricate sequence of decisions
@@ -4085,6 +4097,8 @@ void Clang::ConstructJob(Compilation &C, const JobAction &JA,
   // XXX Nyuzi: disable loop vectorizer by default, because it does not
   // work correctly on this target.  This is a hack. I couldn't find an
   // easy way to do it in the target.
+  
+  // XXX SPMD vectorization is enabled, but only on Nyuzi -- see AddNyuziTargetArgs
 
   // Enable vectorization per default according to the optimization level
   // selected. For optimization levels that want vectorization we use the alias

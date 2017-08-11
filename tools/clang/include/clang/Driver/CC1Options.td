@@ -267,6 +267,8 @@ def vectorize_slp : Flag<["-"], "vectorize-slp">,
   HelpText<"Run the SLP vectorization passes">;
 def vectorize_slp_aggressive : Flag<["-"], "vectorize-slp-aggressive">,
   HelpText<"Run the BB vectorization passes">;
+def vectorize_spmd : Flag<["-"], "vectorize-spmd">,
+  HelpText<"Run the SPMD vectorization passes">;
 def dependent_lib : Joined<["--"], "dependent-lib=">,
   HelpText<"Add dependent library">;
 def linker_option : Joined<["--"], "linker-option=">,
