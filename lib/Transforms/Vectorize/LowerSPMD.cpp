@@ -1223,8 +1223,8 @@ struct VectorizationObstacle {
   StringRef Description;
 };
 
-// This visitor determines whether an instruction involves a vector type (in a
-// way that will cause a problem for this pass)
+// This visitor detects IR constructs that the vectorizer will not be able to
+// handle correctly.
 struct PreconditionCheckerVisitor : InstVisitor<PreconditionCheckerVisitor> {
   std::vector<VectorizationObstacle> Obstacles;
   SmallPtrSet<Type *, 16> SeenTypes;
@@ -1364,11 +1364,11 @@ struct PreconditionCheckerVisitor : InstVisitor<PreconditionCheckerVisitor> {
   }
 };
 
-bool shouldVectorize(Function &F) {
+bool canVectorize(Function &F) {
   PreconditionCheckerVisitor PCV;
   PCV.visit(F);
-  // FIXME: for performance, only accumulate obstacles in debug mode
-  // in release mode we should short circuit once we find any obstacle
+  // FIXME: for performance, should only accumulate obstacles in debug mode
+  // in release mode we should just use a flag ("any obstacle seen?")
   auto Obstacles = std::move(PCV.Obstacles);
 
   // Check reducibility
@@ -1442,24 +1442,65 @@ Function *predefineVectorizedFunction(Function &ScalarFunc) {
   return VectorFunc;
 }
 
+struct FindDirectCalls : InstVisitor<FindDirectCalls> {
+  SmallVector<Function *, 16> Callees;
+
+  void visitCallInst(CallInst &Call) {
+    if (auto F = Call.getCalledFunction()) {
+      Callees.push_back(F);
+    }
+  }
+};
+
+std::vector<Function *>
+findFunctionsToVectorize(const std::vector<CallInst *> &Roots) {
+  SmallPtrSet<Function *, 16> Seen;
+  std::vector<Function *> Worklist;
+  std::vector<Function *> Result;
+
+  auto Consider = [&](Function *F) {
+    if (F && Seen.insert(F).second) {
+      Worklist.push_back(F);
+    }
+  };
+
+  // The roots of the collection process are the call sites of the intrinsic.
+  for (auto Call : Roots) {
+    Consider(unwrapFunctionBitcast(Call->getArgOperand(0)));
+  };
+
+  while (!Worklist.empty()) {
+    Function *F = Worklist.back();
+    Worklist.pop_back();
+    if (F->empty()) {
+      // External function or intrinsic => can't vectorize
+      continue;
+    }
+    Result.push_back(F);
+    FindDirectCalls FDC;
+    FDC.visit(F);
+    std::for_each(FDC.Callees.begin(), FDC.Callees.end(), Consider);
+  }
+
+  return Result;
+}
+
 struct LowerSPMD : public ModulePass {
   static char ID; // Pass identification, replacement for typeid
   LowerSPMD() : ModulePass(ID) {}
 
   bool runOnModule(Module &M) override {
     std::vector<CallInst *> RootCalls;
-    auto Intr = Intrinsic::getDeclaration(&M, Intrinsic::spmd_call);
-    for (User *U : Intr->users()) {
+    auto SpmdCallIntrinsic =
+        Intrinsic::getDeclaration(&M, Intrinsic::spmd_call);
+    for (User *U : SpmdCallIntrinsic->users()) {
       RootCalls.push_back(cast<CallInst>(U));
     }
 
     std::vector<Function *> ScalarFuncs;
-    for (auto &F : M) {
-      if (F.empty()) {
-        continue;
-      }
-      if (shouldVectorize(F)) {
-        ScalarFuncs.push_back(&F);
+    for (Function *F : findFunctionsToVectorize(RootCalls)) {
+      if (canVectorize(*F)) {
+        ScalarFuncs.push_back(F);
         NumFunctionsSPMDVectorized++;
       } else {
         NumFunctionsNotSPMDVectorizable++;
